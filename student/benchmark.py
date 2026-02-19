@@ -191,6 +191,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, float | int | str]:
 
 	total_seconds = sum(step_times)
 	mean_seconds = total_seconds / len(step_times)
+	
+	if len(step_times) > 1:
+		variance = sum((t - mean_seconds) ** 2 for t in step_times) / (len(step_times) - 1)
+		std_seconds = variance ** 0.5
+	else:
+		std_seconds = 0.0
+	
 	tokens_per_step = args.batch_size * args.context_length
 	tokens_per_second = tokens_per_step / mean_seconds
 
@@ -212,6 +219,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, float | int | str]:
 		"warmup_steps": args.warmup_steps,
 		"benchmark_steps": args.benchmark_steps,
 		"mean_step_ms": mean_seconds * 1000.0,
+		"std_step_ms": std_seconds * 1000.0,
 		"total_time_s": total_seconds,
 		"tokens_per_second": tokens_per_second,
 		"max_memory_mib": max_mem_mib,
