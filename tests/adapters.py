@@ -4,6 +4,8 @@ from typing import Type
 
 import torch
 
+import student.benchmark as benchmark
+
 
 
 def get_flashattention_autograd_function_pytorch() -> Type:
