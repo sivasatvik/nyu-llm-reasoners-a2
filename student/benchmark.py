@@ -11,6 +11,11 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+try:
+	import wandb
+except ModuleNotFoundError:
+	wandb = None
+
 
 def _load_basics_transformer_lm() -> type[torch.nn.Module]:
 	try:
@@ -72,6 +77,10 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--markdown-out", type=str, default=None)
 	parser.add_argument("--latex-out", type=str, default=None)
+	parser.add_argument("--wandb", action="store_true")
+	parser.add_argument("--wandb-project", type=str, default="nyu-llm-reasoners-a2-benchmarks")
+	parser.add_argument("--wandb-entity", type=str, default="sm12779-new-york-university")
+	parser.add_argument("--wandb-run-name", type=str, default=None)
 
 	return parser.parse_args()
 
@@ -266,6 +275,65 @@ def _emit_observations_tables(observations_df: pd.DataFrame, markdown_out: str |
 		Path(latex_out).write_text(latex_table + "\n", encoding="utf-8")
 
 
+def _log_to_wandb(
+	args: argparse.Namespace,
+	results: dict[str, float | int | str],
+	step_times_ms: list[float],
+	observations_df: pd.DataFrame,
+) -> None:
+	if not args.wandb:
+		return
+	if wandb is None:
+		raise ModuleNotFoundError("wandb is not installed. Install it or run without --wandb.")
+
+	run = wandb.init(
+		project=args.wandb_project,
+		entity=args.wandb_entity,
+		name=args.wandb_run_name,
+		config={
+			"model_size": args.model_size,
+			"d_model": args.d_model,
+			"d_ff": args.d_ff,
+			"num_layers": args.num_layers,
+			"num_heads": args.num_heads,
+			"vocab_size": args.vocab_size,
+			"context_length": args.context_length,
+			"batch_size": args.batch_size,
+			"mode": args.mode,
+			"warmup_steps": args.warmup_steps,
+			"benchmark_steps": args.benchmark_steps,
+			"device": args.device,
+			"dtype": args.dtype,
+			"seed": args.seed,
+		},
+	)
+
+	step_df = pd.DataFrame(
+		{
+			"measurement_step": list(range(1, len(step_times_ms) + 1)),
+			"step_time_ms": step_times_ms,
+		}
+	)
+	step_table = wandb.Table(dataframe=step_df)
+	summary_table = wandb.Table(dataframe=observations_df)
+
+	run.log(
+		{
+			"benchmark_summary": results,
+			"step_times_table": step_table,
+			"observations_table": summary_table,
+			"step_time_line": wandb.plot.line(
+				step_table,
+				x="measurement_step",
+				y="step_time_ms",
+				title="Benchmark Step Time (ms)",
+			),
+		}
+	)
+
+	run.finish()
+
+
 def _print_results(results: dict[str, float | int | str]) -> None:
 	print("=== Benchmark Results ===")
 	for key, value in results.items():
@@ -281,6 +349,7 @@ def main() -> None:
 	_print_results(results)
 	observations_df = _build_observations_table(step_times_ms)
 	_emit_observations_tables(observations_df, args.markdown_out, args.latex_out)
+	_log_to_wandb(args, results, step_times_ms, observations_df)
 
 
 if __name__ == "__main__":
