@@ -308,28 +308,17 @@ def _log_to_wandb(
 		},
 	)
 
-	step_df = pd.DataFrame(
-		{
-			"measurement_step": list(range(1, len(step_times_ms) + 1)),
-			"step_time_ms": step_times_ms,
-		}
-	)
-	step_table = wandb.Table(dataframe=step_df)
 	summary_table = wandb.Table(dataframe=observations_df)
 
-	run.log(
-		{
-			"benchmark_summary": results,
-			"step_times_table": step_table,
-			"observations_table": summary_table,
-			"step_time_line": wandb.plot.line(
-				step_table,
-				x="measurement_step",
-				y="step_time_ms",
-				title="Benchmark Step Time (ms)",
-			),
-		}
-	)
+	log_data = {
+		"observations_table": summary_table,
+	}
+	log_data.update(results)
+
+	run.log(log_data)
+
+	for step_idx, step_time in enumerate(step_times_ms, start=1):
+		run.log({"measurement_step": step_idx, "step_time_ms": step_time})
 
 	run.finish()
 
