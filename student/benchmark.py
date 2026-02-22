@@ -7,6 +7,7 @@ import timeit
 from dataclasses import dataclass
 from pathlib import Path
 
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -64,11 +65,13 @@ def parse_args() -> argparse.Namespace:
 
 	parser.add_argument("--mode", choices=["forward", "forward-backward"], default="forward-backward")
 	parser.add_argument("--warmup-steps", type=int, default=5)
-	parser.add_argument("--benchmark-steps", type=int, default=20)
+	parser.add_argument("--benchmark-steps", type=int, default=10)
 
 	parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
 	parser.add_argument("--dtype", choices=list(DTYPE_CHOICES), default="bfloat16")
 	parser.add_argument("--seed", type=int, default=42)
+	parser.add_argument("--markdown-out", type=str, default=None)
+	parser.add_argument("--latex-out", type=str, default=None)
 
 	return parser.parse_args()
 
@@ -156,7 +159,7 @@ def _single_step(
 	_synchronize_if_cuda(device)
 
 
-def run_benchmark(args: argparse.Namespace) -> dict[str, float | int | str]:
+def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str], list[float]]:
 	if args.device == "cuda" and not torch.cuda.is_available():
 		raise RuntimeError("CUDA requested but no CUDA device is available.")
 
@@ -205,7 +208,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, float | int | str]:
 	if device.type == "cuda":
 		max_mem_mib = torch.cuda.max_memory_allocated(device) / (1024**2)
 
-	return {
+	results = {
 		"device": str(device),
 		"dtype": args.dtype,
 		"mode": args.mode,
@@ -224,6 +227,43 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, float | int | str]:
 		"tokens_per_second": tokens_per_second,
 		"max_memory_mib": max_mem_mib,
 	}
+	return results, [t * 1000.0 for t in step_times]
+
+
+def _build_observations_table(step_times_ms: list[float]) -> pd.DataFrame:
+	if len(step_times_ms) == 0:
+		raise ValueError("No benchmark measurements were collected.")
+
+	mean_step_ms = sum(step_times_ms) / len(step_times_ms)
+	if len(step_times_ms) > 1:
+		variance = sum((t - mean_step_ms) ** 2 for t in step_times_ms) / (len(step_times_ms) - 1)
+		std_step_ms = variance ** 0.5
+	else:
+		std_step_ms = 0.0
+
+	row: dict[str, float] = {}
+	for idx, value in enumerate(step_times_ms, start=1):
+		row[f"measurement_{idx}_ms"] = value
+
+	row["mean_step_ms"] = mean_step_ms
+	row["std_step_ms"] = std_step_ms
+	return pd.DataFrame([row])
+
+
+def _emit_observations_tables(observations_df: pd.DataFrame, markdown_out: str | None, latex_out: str | None) -> None:
+	markdown_table = observations_df.to_markdown(index=False, floatfmt=".4f")
+	latex_table = observations_df.to_latex(index=False, float_format="%.4f")
+
+	print("\n=== Observations (Markdown) ===")
+	print(markdown_table)
+
+	print("\n=== Observations (LaTeX) ===")
+	print(latex_table)
+
+	if markdown_out:
+		Path(markdown_out).write_text(markdown_table + "\n", encoding="utf-8")
+	if latex_out:
+		Path(latex_out).write_text(latex_table + "\n", encoding="utf-8")
 
 
 def _print_results(results: dict[str, float | int | str]) -> None:
@@ -237,8 +277,10 @@ def _print_results(results: dict[str, float | int | str]) -> None:
 
 def main() -> None:
 	args = parse_args()
-	results = run_benchmark(args)
+	results, step_times_ms = run_benchmark(args)
 	_print_results(results)
+	observations_df = _build_observations_table(step_times_ms)
+	_emit_observations_tables(observations_df, args.markdown_out, args.latex_out)
 
 
 if __name__ == "__main__":
