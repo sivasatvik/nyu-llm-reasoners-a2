@@ -24,9 +24,8 @@ run_profile() {
     
     nsys profile \
         --output "$output_path" \
-        --sample=cpu \
-        --trace cuda,cudnn,cublas \
-        python -m student.benchmark \
+        --python-backtrace=cuda \
+        uv run -m student.benchmark \
             --model-size "$model_size" \
             --context-length "$context_length" \
             --mode "$mode" \
