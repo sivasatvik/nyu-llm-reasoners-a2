@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import torch.cuda.nvtx as nvtx
 
 try:
 	import wandb
@@ -81,9 +82,25 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--wandb-project", type=str, default="nyu-llm-reasoners-a2-benchmarks")
 	parser.add_argument("--wandb-entity", type=str, default="sm12779-new-york-university")
 	parser.add_argument("--wandb-run-name", type=str, default=None)
+	parser.add_argument("--custom-attention", action="store_true", help="Use custom annotated scaled dot product attention from utils.py")
 
 	return parser.parse_args()
 
+
+def _load_custom_attention():
+	try:
+		return importlib.import_module("student.utils").annotated_scaled_dot_product_attention
+	except (ModuleNotFoundError, AttributeError):
+		return None
+
+def _apply_custom_attention(model: torch.nn.Module) -> None:
+	custom_attention = _load_custom_attention()
+	if custom_attention is None:
+		raise RuntimeError("Failed to load custom attention from student.utils")
+
+	for module in model.modules():
+		if hasattr(module, "attention_fn"):
+			module.attention_fn = custom_attention
 
 def _synchronize_if_cuda(device: torch.device) -> None:
 	if device.type == "cuda":
@@ -128,6 +145,11 @@ def _build_model(args: argparse.Namespace, spec: ModelSpec, device: torch.device
 		rope_theta=args.rope_theta,
 	)
 	model.to(device=device, dtype=dtype)
+
+	if args.custom_attention:
+		print("Applying custom annotated scaled dot product attention...")
+		_apply_custom_attention(model)
+
 	return model
 
 
@@ -157,14 +179,21 @@ def _single_step(
 	device: torch.device,
 ) -> None:
 	if mode == "forward":
-		with torch.no_grad():
-			_ = model(x)
+		with nvtx.range("forward_pass"):
+			with torch.no_grad():
+				_ = model(x)
 		_synchronize_if_cuda(device)
 		return
 
-	logits = model(x)
-	loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-	loss.backward()
+	with nvtx.range("forward_pass"):
+		logits = model(x)
+
+	with nvtx.range("compute_loss"):
+		loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
+	with nvtx.range("backward_pass"):
+		loss.backward()
+
 	_synchronize_if_cuda(device)
 
 
@@ -187,19 +216,23 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 
 	model.train(args.mode == "forward-backward")
 
-	for _ in range(args.warmup_steps):
-		if args.mode == "forward-backward":
-			model.zero_grad(set_to_none=True)
-		_single_step(model, x, y, args.mode, device)
+	with nvtx.range("warmup_steps"):
+		for warmup_idx in range(args.warmup_steps):
+			with nvtx.range(f"warmup_step_{warmup_idx + 1}"):
+				if args.mode == "forward-backward":
+					model.zero_grad(set_to_none=True)
+				_single_step(model, x, y, args.mode, device)
 
 	step_times: list[float] = []
-	for _ in range(args.benchmark_steps):
-		if args.mode == "forward-backward":
-			model.zero_grad(set_to_none=True)
-		start = timeit.default_timer()
-		_single_step(model, x, y, args.mode, device)
-		end = timeit.default_timer()
-		step_times.append(end - start)
+	with nvtx.range("benchmark_steps"):
+		for step_idx in range(args.benchmark_steps):
+			with nvtx.range(f"benchmark_step_{step_idx + 1}"):
+				if args.mode == "forward-backward":
+					model.zero_grad(set_to_none=True)
+				start = timeit.default_timer()
+				_single_step(model, x, y, args.mode, device)
+				end = timeit.default_timer()
+				step_times.append(end - start)
 
 	total_seconds = sum(step_times)
 	mean_seconds = total_seconds / len(step_times)
@@ -230,6 +263,7 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 		"context_length": args.context_length,
 		"warmup_steps": args.warmup_steps,
 		"benchmark_steps": args.benchmark_steps,
+		"custom_attention": args.custom_attention,
 		"mean_step_ms": mean_seconds * 1000.0,
 		"std_step_ms": std_seconds * 1000.0,
 		"total_time_s": total_seconds,
