@@ -5,6 +5,8 @@
 \usepackage{listings}
 \usepackage{amsmath}
 \usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{graphicx}
 
 
 \begin{document}
@@ -34,9 +36,38 @@
     \begin{enumerate}
         \item[1.1] \textbf{\texttt{benchmarking\_script}}
             \begin{enumerate}[label=\alph*.]
-                \item The script is present at student/
-                \item 
-                \item
+                \item The script is present at student/benchmark.py
+                \item The following table shows the timings for the forward and forward+backward passes for each of the model sizes. The mean and standard deviation are computed across 10 runs for each model size and pass type.
+                    \begin{table}[h]
+                        \centering
+                            \begin{tabular}{|r|r|r|r|}
+                                \hline
+                                model\_size & pass & mean\_step\_ms & std\_step\_ms \\
+                                \hline
+                                small & forward & 34.7421 & 0.2440 \\
+                                \hline
+                                small & forward+backward & 84.1578 & 0.4178 \\
+                                \hline
+                                medium & forward & 71.0755 & 3.2061  \\
+                                \hline
+                                medium & forward+backward & 215.5571 & 0.3645  \\
+                                \hline
+                                large & forward & 141.2933 & 0.1184 \\
+                                \hline
+                                large & forward+backward & 436.3411 & 0.3570  \\
+                                \hline
+                                xl & forward & 280.6156 & 0.0603 \\
+                                \hline
+                                xl & forward+backward & 888.9120 & 0.1919  \\
+                                \hline
+                                2.7B & forward & 417.7063 & 0.1057 \\
+                                \hline
+                                2.7B & forward+backward & 1320.3845 & 1.0714  \\
+                                \hline
+                            \end{tabular}
+                    \end{table}
+                    Backward pass is taking significantly more time than the forward pass, which is expected since it involves computing gradients for all parameters. As the model size increases, both forward and backward pass times increase, with the backward pass showing a more significant increase due to the larger number of parameters and computations involved. Generally, variance in timings is low (medium forward pass has higher variance than others), which suggests that the measurements are consistent across runs.
+                \item When running the measurement steps without the warmup steps, the timings for the first couple of iterations are significantly higher than the subsequent iterations. This is obvious when running the measurement steps with 2 warmup steps, where the timings are almost same as runs with 5 warmup steps as in the previous experiment. This is because the first few iterations involve additional overhead from things like memory allocation, kernel compilation, and other setup tasks that are not representative of the steady-state performance of the model. By including warmup steps, we allow the system to reach a more stable state before we start measuring the performance, which results in more accurate and consistent timing measurements.
             \end{enumerate}
         \item[1.1] \textbf{\texttt{nsys\_profile}}
             \begin{enumerate}[label=\alph*.]
