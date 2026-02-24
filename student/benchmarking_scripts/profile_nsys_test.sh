@@ -14,6 +14,7 @@ echo ""
 
 nsys profile \
     --output "$OUTPUT_PATH" \
+    --trace cuda,cudnn,cublas,nvtx \
     --python-backtrace=cuda \
     uv run -m student.benchmark \
         --model-size small \

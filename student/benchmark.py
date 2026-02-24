@@ -98,9 +98,8 @@ def _apply_custom_attention(model: torch.nn.Module) -> None:
 	if custom_attention is None:
 		raise RuntimeError("Failed to load custom attention from student.utils")
 
-	for module in model.modules():
-		if hasattr(module, "attention_fn"):
-			module.attention_fn = custom_attention
+	model_module = importlib.import_module("a1_basics.model")
+	setattr(model_module, "scaled_dot_product_attention", custom_attention)
 
 def _synchronize_if_cuda(device: torch.device) -> None:
 	if device.type == "cuda":
