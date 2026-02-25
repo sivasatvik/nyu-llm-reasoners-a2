@@ -403,7 +403,16 @@ class SwiGLU(nn.Module):
         self.w3 = Linear(d_model, d_ff)
 
     def forward(self, x):
-        return self.w2(silu(self.w1(x)) * self.w3(x))
+        with nvtx.range("ffn_w1_projection"):
+            w1_out = self.w1(x)
+        with nvtx.range("ffn_silu_activation"):
+            silu_out = silu(w1_out)
+        with nvtx.range("ffn_w3_projection"):
+            w3_out = self.w3(x)
+        with nvtx.range("ffn_gate_multiply"):
+            gated = silu_out * w3_out
+        with nvtx.range("ffn_w2_projection"):
+            return self.w2(gated)
 
 
 def scaled_dot_product_attention(
@@ -502,9 +511,11 @@ class CausalMultiHeadSelfAttention(nn.Module):
             *b, sequence_length, d_model = x.size()
             assert d_model == self.d_model
 
-            with nvtx.range("qkv_projections"):
+            with nvtx.range("q_projection"):
                 Q = self.q_proj(x)
+            with nvtx.range("k_projection"):
                 K = self.k_proj(x)
+            with nvtx.range("v_projection"):
                 V = self.v_proj(x)
 
             # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
