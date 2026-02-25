@@ -83,6 +83,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--wandb-entity", type=str, default="sm12779-new-york-university")
 	parser.add_argument("--wandb-run-name", type=str, default=None)
 	parser.add_argument("--custom-attention", action="store_true", help="Use custom annotated scaled dot product attention from utils.py")
+	parser.add_argument("--optimizer-step", action="store_true", help="Run optimizer.step() after backward pass in forward-backward mode")
 
 	return parser.parse_args()
 
@@ -131,6 +132,8 @@ def _validate_args(args: argparse.Namespace, spec: ModelSpec, device: torch.devi
 		raise ValueError("vocab-size must be > 0")
 	if device.type == "cpu" and dtype == torch.float16:
 		raise ValueError("float16 on CPU is not supported for this benchmark. Use float32 or bfloat16.")
+	if args.optimizer_step and args.mode != "forward-backward":
+		raise ValueError("--optimizer-step can only be used with --mode forward-backward")
 
 
 def _build_model(args: argparse.Namespace, spec: ModelSpec, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
@@ -176,6 +179,7 @@ def _single_step(
 	y: torch.Tensor,
 	mode: str,
 	device: torch.device,
+	optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
 	if mode == "forward":
 		with nvtx.range("forward_pass"):
@@ -192,6 +196,10 @@ def _single_step(
 
 	with nvtx.range("backward_pass"):
 		loss.backward()
+
+	if optimizer is not None:
+		with nvtx.range("optimizer_step"):
+			optimizer.step()
 
 	_synchronize_if_cuda(device)
 
@@ -211,6 +219,9 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 		torch.cuda.reset_peak_memory_stats(device)
 
 	model = _build_model(args, spec, device, dtype)
+	optimizer: torch.optim.Optimizer | None = None
+	if args.optimizer_step:
+		optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 	x, y = _make_random_batch(args, device)
 
 	model.train(args.mode == "forward-backward")
@@ -220,7 +231,7 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 			with nvtx.range(f"warmup_step_{warmup_idx + 1}"):
 				if args.mode == "forward-backward":
 					model.zero_grad(set_to_none=True)
-				_single_step(model, x, y, args.mode, device)
+				_single_step(model, x, y, args.mode, device, optimizer=optimizer)
 
 	step_times: list[float] = []
 	with nvtx.range("benchmark_steps"):
@@ -229,7 +240,7 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 				if args.mode == "forward-backward":
 					model.zero_grad(set_to_none=True)
 				start = timeit.default_timer()
-				_single_step(model, x, y, args.mode, device)
+				_single_step(model, x, y, args.mode, device, optimizer=optimizer)
 				end = timeit.default_timer()
 				step_times.append(end - start)
 
@@ -263,6 +274,7 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 		"warmup_steps": args.warmup_steps,
 		"benchmark_steps": args.benchmark_steps,
 		"custom_attention": args.custom_attention,
+		"optimizer_step": args.optimizer_step,
 		"mean_step_ms": mean_seconds * 1000.0,
 		"std_step_ms": std_seconds * 1000.0,
 		"total_time_s": total_seconds,
@@ -335,6 +347,7 @@ def _log_to_wandb(
 			"mode": args.mode,
 			"warmup_steps": args.warmup_steps,
 			"benchmark_steps": args.benchmark_steps,
+			"optimizer_step": args.optimizer_step,
 			"device": args.device,
 			"dtype": args.dtype,
 			"seed": args.seed,

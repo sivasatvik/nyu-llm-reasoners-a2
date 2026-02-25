@@ -24,7 +24,10 @@ run_profile() {
     
     nsys profile \
         --output "$output_path" \
+        --stats=true \
+        --trace cuda,cudnn,cublas,nvtx \
         --python-backtrace=cuda \
+        --force-overwrite=true \
         uv run -m student.benchmark \
             --model-size "$model_size" \
             --context-length "$context_length" \
@@ -59,8 +62,8 @@ done
 # Profile: Forward-backward for key combinations (skip largest models)
 echo ""
 echo "=== FORWARD-BACKWARD PASS ==="
-for model_size in "small" "medium" "large"; do
-    for context_length in 256 512; do
+for model_size in "${MODEL_SIZES[@]}"; do
+    for context_length in "${CONTEXT_LENGTHS[@]}"; do
         run_profile "$model_size" "$context_length" "forward-backward" || true
     done
 done

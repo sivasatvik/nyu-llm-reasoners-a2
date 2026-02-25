@@ -10,6 +10,7 @@ import einx
 
 import torch
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
 from torch import Tensor
 from jaxtyping import Float, Bool, Int
 
@@ -237,20 +238,25 @@ class BasicsTransformerLM(nn.Module):
             (batch size, sequence_length, vocab_size) with the predicted unnormalized next-word
             distribution for each token.
         """
-        _, sequence_length = x.size()
+        with nvtx.range("model_forward"):
+            _, sequence_length = x.size()
 
-        # (batch size, sequence_length, d_model)
-        x = self.token_embeddings(x)
-
-        for layer in self.layers:
             # (batch size, sequence_length, d_model)
-            x = layer(x)
+            with nvtx.range("token_embedding"):
+                x = self.token_embeddings(x)
 
-        # (batch size, sequence_length, d_model)
-        x = self.ln_final(x)
+            for idx, layer in enumerate(self.layers):
+                # (batch size, sequence_length, d_model)
+                with nvtx.range(f"transformer_layer_{idx}"):
+                    x = layer(x)
 
-        # (batch size, sequence_length, vocab_size)
-        return self.lm_head(x)
+            # (batch size, sequence_length, d_model)
+            with nvtx.range("final_rmsnorm"):
+                x = self.ln_final(x)
+
+            # (batch size, sequence_length, vocab_size)
+            with nvtx.range("lm_head"):
+                return self.lm_head(x)
 
     @torch.no_grad()
     def generate(
@@ -374,16 +380,19 @@ class TransformerBlock(nn.Module):
         Returns:
             FloatTensor of shape `(batch_size, sequence_length, d_model)`.
         """
-        # NOTE: this is a pre-norm Transformer, and differs from the original
-        # description in the paper.
-        # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
-        attn_sublayer_output = x + x_attn
+        with nvtx.range("transformer_block"):
+            # NOTE: this is a pre-norm Transformer, and differs from the original
+            # description in the paper.
+            # Apply the multi-head self-attention sublayer
+            with nvtx.range("attention_sublayer"):
+                x_attn = self.attn(self.ln1(x))
+                attn_sublayer_output = x + x_attn
 
-        # Apply the feed-forward sublayer
-        x_ffn = self.ffn(self.ln2(attn_sublayer_output))
-        ffn_sublayer_output = attn_sublayer_output + x_ffn
-        return ffn_sublayer_output
+            # Apply the feed-forward sublayer
+            with nvtx.range("ffn_sublayer"):
+                x_ffn = self.ffn(self.ln2(attn_sublayer_output))
+                ffn_sublayer_output = attn_sublayer_output + x_ffn
+            return ffn_sublayer_output
 
 
 class SwiGLU(nn.Module):
@@ -421,15 +430,20 @@ def scaled_dot_product_attention(
         implementation with the provided key, query, and value tensors.
     """
 
-    d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+    with nvtx.range("scaled dot product attention"):
+        d_k = K.shape[-1]
+        with nvtx.range("computing attention scores"):
+            attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
-    if mask is not None:
-        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+        if mask is not None:
+            with nvtx.range("apply attention mask"):
+                attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+        with nvtx.range("computing softmax"):
+            attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
 
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+        with nvtx.range("final matmul"):
+            return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
 
 class CausalMultiHeadSelfAttention(nn.Module):
@@ -484,44 +498,51 @@ class CausalMultiHeadSelfAttention(nn.Module):
         Returns:
             Self-attention outputs.
         """
-        *b, sequence_length, d_model = x.size()
-        assert d_model == self.d_model
+        with nvtx.range("causal_mhsa"):
+            *b, sequence_length, d_model = x.size()
+            assert d_model == self.d_model
 
-        Q = self.q_proj(x)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
+            with nvtx.range("qkv_projections"):
+                Q = self.q_proj(x)
+                K = self.k_proj(x)
+                V = self.v_proj(x)
 
-        # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
-        Q, K, V = (
-            rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
-            for X in (Q, K, V)
-        )  # fmt: skip
+            # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
+            with nvtx.range("split_heads"):
+                Q, K, V = (
+                    rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
+                    for X in (Q, K, V)
+                )  # fmt: skip
 
-        if token_positions is None:
-            token_positions = einx.rearrange("seq -> b... seq", torch.arange(sequence_length, device=x.device), b=[1] * len(b))
+            if token_positions is None:
+                token_positions = einx.rearrange("seq -> b... seq", torch.arange(sequence_length, device=x.device), b=[1] * len(b))
 
-        # Duplicate token positions for each head
-        token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
+            # Duplicate token positions for each head
+            token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
 
-        Q = self.positional_encoder(Q, token_positions)
-        K = self.positional_encoder(K, token_positions)
+            with nvtx.range("apply_rope"):
+                Q = self.positional_encoder(Q, token_positions)
+                K = self.positional_encoder(K, token_positions)
 
-        # Construct causal mask
-        seq = torch.arange(sequence_length, device=x.device)
-        qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
-        kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
-        causal_mask = qi >= kj  # (query, key)
+            # Construct causal mask
+            with nvtx.range("build_causal_mask"):
+                seq = torch.arange(sequence_length, device=x.device)
+                qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
+                kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+                causal_mask = qi >= kj  # (query, key)
 
-        # Shape: (..., num_heads, sequence_length, d_k)
-        attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
+            # Shape: (..., num_heads, sequence_length, d_k)
+            attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
 
-        # Concatenate the attention output from all heads.
-        # (..., sequence_length, num_heads * d_v).
-        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
+            # Concatenate the attention output from all heads.
+            # (..., sequence_length, num_heads * d_v).
+            with nvtx.range("merge_heads"):
+                attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
 
-        # Apply the output projection
-        output = self.output_proj(attn_output)
-        return output
+            # Apply the output projection
+            with nvtx.range("output_projection"):
+                output = self.output_proj(attn_output)
+            return output
 
 def silu(x: torch.Tensor):
     return x * torch.sigmoid(x)

@@ -71,8 +71,8 @@
             \end{enumerate}
         \item[1.1] \textbf{\texttt{nsys\_profile}}
             \begin{enumerate}[label=\alph*.]
-                \item
-                \item 
+                \item The times for forward pass here are very similar to the times obtained in the previous section for the forward pass. This is expected since both measurements are for the same operation (forward pass) and should be consistent (The context length is the same in the comparision).
+                \item The CUDA kernel that takes the most time in the forward pass is the ampere\_sgemm\_128x64\_tn kernel, which is a matrix multiplication kernel used in the attention mechanism of the transformer model. This kernel is responsible for computing the dot product between the query and key matrices, which is a critical operation in the attention mechanism. The high time taken by this kernel indicates that it is a computational bottleneck in the forward pass, especially as the model size increases.
                 \item
                 \item
                 \item
