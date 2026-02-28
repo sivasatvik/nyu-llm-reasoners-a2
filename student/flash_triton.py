@@ -4,17 +4,35 @@ from __future__ import annotations
 import torch
 
 from student.flash_backward import flash_attention_backward
-from student.flash_pytorch import flash_attention2_forward_pytorch
-
-try:
-    import triton
-    import triton.language as tl
-except ModuleNotFoundError:
-    triton = None
-    tl = None
+triton = None
+tl = None
+_flash_fwd_kernel = None
 
 
-if triton is not None:
+def _ensure_triton_loaded() -> None:
+    global triton, tl
+    if triton is not None and tl is not None:
+        return
+    try:
+        import triton as _triton
+        import triton.language as _tl
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Triton is required for FlashAttention2AutogradFunctionTriton. "
+            "Install it in the same environment used by pytest, e.g. `uv pip install triton`."
+        ) from exc
+
+    triton = _triton
+    tl = _tl
+
+
+def _get_flash_fwd_kernel():
+    global _flash_fwd_kernel
+    if _flash_fwd_kernel is not None:
+        return _flash_fwd_kernel
+
+    _ensure_triton_loaded()
+
     @triton.jit
     def flash_fwd_kernel(
         Q_ptr,
@@ -123,6 +141,9 @@ if triton is not None:
         l_ptrs = L_ptr + batch_index * stride_lb + q_start * stride_lq + tl.arange(0, Q_TILE_SIZE) * stride_lq
         tl.store(l_ptrs, m_i + tl.log(l_i))
 
+    _flash_fwd_kernel = flash_fwd_kernel
+    return _flash_fwd_kernel
+
 
 class FlashAttention2AutogradFunctionTriton(torch.autograd.Function):
     @staticmethod
@@ -133,14 +154,10 @@ class FlashAttention2AutogradFunctionTriton(torch.autograd.Function):
         V: torch.Tensor,
         is_causal: bool = False,
     ) -> torch.Tensor:
-        if triton is None:
-            raise RuntimeError("Triton is not installed.")
+        _ensure_triton_loaded()
 
         if not Q.is_cuda:
-            O, L = flash_attention2_forward_pytorch(Q, K, V, is_causal=is_causal)
-            ctx.save_for_backward(L, Q, K, V, O)
-            ctx.is_causal = is_causal
-            return O
+            raise ValueError("FlashAttention2AutogradFunctionTriton expects CUDA tensors.")
 
         batch_size, n_queries, d = Q.shape
         n_keys = K.shape[-2]
@@ -150,6 +167,7 @@ class FlashAttention2AutogradFunctionTriton(torch.autograd.Function):
 
         O = torch.empty_like(Q)
         L = torch.empty((batch_size, n_queries), device=Q.device, dtype=torch.float32)
+        flash_fwd_kernel = _get_flash_fwd_kernel()
 
         grid = (triton.cdiv(n_queries, q_tile_size), batch_size)
         flash_fwd_kernel[grid](
