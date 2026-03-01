@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 from einops import einsum
 
-from student.flash_triton import FlashAttention2AutogradFunctionTriton
+from student.flash_triton import FlashAttention
 
 try:
     import triton
@@ -49,14 +49,14 @@ def _bench_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl: str, is
 
     if impl == "triton":
         def fwd():
-            FlashAttention2AutogradFunctionTriton.apply(q, k, v, is_causal)
+            FlashAttention.apply(q, k, v, is_causal)
 
         def bwd():
-            out = FlashAttention2AutogradFunctionTriton.apply(q, k, v, is_causal)
+            out = FlashAttention.apply(q, k, v, is_causal)
             out.backward(do, retain_graph=False)
 
         def e2e():
-            out = FlashAttention2AutogradFunctionTriton.apply(q, k, v, is_causal)
+            out = FlashAttention.apply(q, k, v, is_causal)
             out.backward(do, retain_graph=False)
     else:
         def fwd():
