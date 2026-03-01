@@ -5,9 +5,8 @@ from typing import Type
 import torch
 
 import student.benchmark as benchmark
-from student.flash_pytorch import FlashAttention2AutogradFunctionPytorch
-from student.flash_triton import FlashAttention2AutogradFunctionTriton
-from student.flashattention import FlashAttentionPytorch, FlashAttention
+from student.flash_pytorch import FlashAttentionPytorch
+from student.flash_triton import FlashAttention
 
 
 

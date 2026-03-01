@@ -1,90 +1,65 @@
 from __future__ import annotations
 
 import torch
-from einops import einsum
-
-from student.flash_backward import flash_attention_backward
-
-
-def flash_attention2_forward_pytorch(
-    Q: torch.Tensor,
-    K: torch.Tensor,
-    V: torch.Tensor,
-    is_causal: bool = False,
-    q_tile_size: int = 16,
-    k_tile_size: int = 16,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if q_tile_size < 16 or k_tile_size < 16:
-        raise ValueError("Tile sizes must be at least 16.")
-
-    batch_size, n_queries, d = Q.shape
-    n_keys = K.shape[-2]
-    scale = d ** -0.5
-
-    O = torch.zeros_like(Q)
-    L = torch.empty((batch_size, n_queries), device=Q.device, dtype=torch.float32)
-
-    for q_start in range(0, n_queries, q_tile_size):
-        q_end = q_start + q_tile_size
-
-        q_i = Q[:, q_start:q_end, :]
-
-        m_i = torch.full((batch_size, q_tile_size), -float("inf"), device=Q.device, dtype=torch.float32)
-        l_i = torch.zeros((batch_size, q_tile_size), device=Q.device, dtype=torch.float32)
-        o_i = torch.zeros((batch_size, q_tile_size, d), device=Q.device, dtype=torch.float32)
-
-        for k_start in range(0, n_keys, k_tile_size):
-            k_end = k_start + k_tile_size
-
-            k_j = K[:, k_start:k_end, :]
-            v_j = V[:, k_start:k_end, :]
-
-            s_ij = einsum(q_i, k_j, "b q d, b k d -> b q k") * scale
-            s_ij = s_ij.to(torch.float32)
-
-            if is_causal:
-                q_idx = torch.arange(q_start, q_end, device=Q.device)
-                k_idx = torch.arange(k_start, k_end, device=Q.device)
-                causal_mask = q_idx[:, None] >= k_idx[None, :]
-                s_ij = torch.where(causal_mask[None, :, :], s_ij, torch.full_like(s_ij, -1e6))
-
-            m_ij = torch.max(s_ij, dim=-1).values
-            p_ij = torch.exp(s_ij - m_ij[..., None])
-            l_ij = torch.sum(p_ij, dim=-1)
-
-            m_new = torch.maximum(m_i, m_ij)
-            alpha = torch.exp(m_i - m_new)
-            beta = torch.exp(m_ij - m_new)
-            l_new = alpha * l_i + beta * l_ij
-
-            pv = einsum(p_ij.to(v_j.dtype), v_j, "b q k, b k d -> b q d").to(torch.float32)
-            o_i = (alpha * l_i / l_new)[..., None] * o_i + (beta / l_new)[..., None] * pv
-
-            m_i = m_new
-            l_i = l_new
-
-        O[:, q_start:q_end, :] = o_i.to(Q.dtype)
-        L[:, q_start:q_end] = m_i + torch.log(l_i)
-
-    return O, L
+import math
+from einops import rearrange, einsum
 
 
-class FlashAttention2AutogradFunctionPytorch(torch.autograd.Function):
+class FlashAttentionPytorch(torch.autograd.Function):
     @staticmethod
-    def forward(
-        ctx,
-        Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        O, L = flash_attention2_forward_pytorch(Q, K, V, is_causal=is_causal)
-        ctx.save_for_backward(L, Q, K, V, O)
+    def forward(ctx, Q : torch.Tensor, K : torch.Tensor, V : torch.Tensor, is_causal=False):
+        B_q = B_k = 16
+        # B_k = 1
+        T_q = math.ceil(Q.shape[-2] // B_q)
+        T_k = math.ceil(K.shape[-2] // B_k)
+        print(K.shape)
+        d = Q.shape[-1]
+        device = "cpu"
+        O_i = torch.empty(*Q.shape[:-2],B_q, d, device= device)
+        O = torch.empty(Q.shape, device=device)
+        L = torch.empty(Q.shape[:-1], device=device)
+        l_i = torch.empty(*Q.shape[:-2], B_q, device = device)
+        m_i = torch.empty(*Q.shape[:-2], B_q, device = device)
+        sqrt_d = math.sqrt(d)
+        for i in range(T_q):
+            offset_i = i*B_q
+            Q_i = Q[:,offset_i:offset_i + B_q, :]
+            O_i.zero_()
+            l_i.zero_()
+            m_i.fill_(float('-inf'))
+            for j in range(T_k):
+                offset_j = j*B_k
+                K_j = K[:,offset_j:offset_j + B_k, :]
+                V_j = V[:,offset_j:offset_j + B_k, :]
+                S = einsum(Q_i, K_j, "... i d, ... j d -> ... i j")/sqrt_d
+                m_i_new = torch.max(m_i, torch.max(S, dim = -1)[0])
+                tildeP = torch.exp(S - m_i_new.unsqueeze(-1))
+                l_i = torch.exp(m_i - m_i_new)*l_i + torch.sum(tildeP, dim=-1)
+                O_i = einsum(torch.exp(m_i - m_i_new), O_i, "... a, ... a b-> ... a b") 
+                O_i += einsum(tildeP, V_j, "... a b, ... b d -> ... a d")
+                m_i = m_i_new
+            O_i = einsum(l_i.reciprocal(), O_i, "... a, ... a b -> ... a b")
+            O[:, offset_i:offset_i + B_q,:] = O_i
+            L[:, offset_i:offset_i + B_q] = m_i + torch.log(l_i)
+        ctx.save_for_backward(Q,K,V,L,O)
         ctx.is_causal = is_causal
+        ctx.B_q = B_q
+        ctx.B_k = B_k
+        ctx.sqrt_d = sqrt_d
+        ctx.T_q = T_q
+        ctx.T_k = T_k
+        ctx.d = d
         return O
 
-    @staticmethod
-    def backward(ctx, dO: torch.Tensor):
-        L, Q, K, V, O = ctx.saved_tensors
-        dQ, dK, dV = flash_attention_backward(Q, K, V, O, dO, L, bool(ctx.is_causal))
+    def backward(ctx, dO):
+        Q,K,V,L,O = ctx.saved_tensors
+        D = (O * dO).sum(dim=-1, keepdim=True)
+        S = einsum(Q, K, "... i d, ... j d -> ... i j")/ctx.sqrt_d
+        P = torch.exp(S - L.unsqueeze(-1))
+        dV = einsum(P, dO, "... i j, ... i d -> ... j d")
+        dP = einsum(dO, V, "... i d, ... j d -> ... i j")
+        dS = P * (dP - D)
+        dQ = einsum(dS, K, "... a b, ... b c-> ... a c")/ctx.sqrt_d
+        dK = einsum(dS, Q, "... a b, ... a d -> ... b d")/ctx.sqrt_d
+
         return dQ, dK, dV, None

@@ -1,210 +1,181 @@
-# pyright: reportMissingImports=false, reportInvalidTypeForm=false
 from __future__ import annotations
 
-import torch
-
-from student.flash_backward import flash_attention_backward
-triton = None
-tl = None
-_flash_fwd_kernel = None
+import torch, triton, os
+import triton.language as tl
+import math
+from einops import rearrange, einsum
 
 
-def _ensure_triton_loaded() -> None:
-    global triton, tl
-    if triton is not None and tl is not None:
-        return
-    try:
-        import triton as _triton
-        import triton.language as _tl
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to initialize Triton runtime. Ensure both `triton` and `setuptools` are installed "
-            "in the same environment used by pytest (e.g., `uv pip install setuptools triton`)."
-        ) from exc
-
-    triton = _triton
-    tl = _tl
-
-
-def _get_flash_fwd_kernel():
-    global _flash_fwd_kernel
-    if _flash_fwd_kernel is not None:
-        return _flash_fwd_kernel
-
-    _ensure_triton_loaded()
-
-    @triton.jit
-    def flash_fwd_kernel(
-        Q_ptr,
-        K_ptr,
-        V_ptr,
-        O_ptr,
-        L_ptr,
-        stride_qb,
-        stride_qq,
-        stride_qd,
-        stride_kb,
-        stride_kk,
-        stride_kd,
-        stride_vb,
-        stride_vk,
-        stride_vd,
-        stride_ob,
-        stride_oq,
-        stride_od,
-        stride_lb,
-        stride_lq,
-        N_QUERIES,
-        N_KEYS,
-        scale,
-        is_causal: tl.constexpr,
-        D: tl.constexpr,
-        Q_TILE_SIZE: tl.constexpr,
-        K_TILE_SIZE: tl.constexpr,
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    is_causal : tl.constexpr
     ):
-        query_tile_index = tl.program_id(0)
-        batch_index = tl.program_id(1)
+    # Program indices
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
 
-        q_start = query_tile_index * Q_TILE_SIZE
+    # Offset each pointer with the corresponding batch index
+    # multiplied with the batch stride for each tensor
+    Q_block_ptr = tl.make_block_ptr(
+    Q_ptr + batch_index * stride_qb,
+    shape=(N_QUERIES, D),
+    strides=(stride_qq, stride_qd),
+    offsets=(query_tile_index * Q_TILE_SIZE, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(1, 0),
+    )
 
-        Q_block_ptr = tl.make_block_ptr(
-            Q_ptr + batch_index * stride_qb,
-            shape=(N_QUERIES, D),
-            strides=(stride_qq, stride_qd),
-            offsets=(q_start, 0),
-            block_shape=(Q_TILE_SIZE, D),
-            order=(1, 0),
-        )
+    O_block_ptr = tl.make_block_ptr(
+    O_ptr + batch_index * stride_ob,
+    shape=(N_QUERIES, D),
+    strides=(stride_oq, stride_od),
+    offsets=(query_tile_index * Q_TILE_SIZE, 0),
+    block_shape=(Q_TILE_SIZE, D),
+    order=(1, 0),
+    )
 
-        q = tl.load(Q_block_ptr)
+    L_block_ptr = tl.make_block_ptr(
+    L_ptr + batch_index * stride_lb,
+    shape=(N_QUERIES,),
+    strides=(stride_lq,),
+    offsets=(query_tile_index * Q_TILE_SIZE,),
+    block_shape=(Q_TILE_SIZE,),
+    order=(0,),
+    )
 
-        m_i = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)
-        l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-        o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    K_block_ptr = tl.make_block_ptr(
+    K_ptr + batch_index * stride_kb,
+    shape=(N_KEYS, D),
+    strides=(stride_kk, stride_kd),
+    offsets=(0, 0),
+    block_shape=(K_TILE_SIZE, D),
+    order=(1, 0),
+    )
 
-        for k_start in range(0, N_KEYS, K_TILE_SIZE):
-            K_block_ptr = tl.make_block_ptr(
-                K_ptr + batch_index * stride_kb,
-                shape=(N_KEYS, D),
-                strides=(stride_kk, stride_kd),
-                offsets=(k_start, 0),
-                block_shape=(K_TILE_SIZE, D),
-                order=(1, 0),
-            )
-            V_block_ptr = tl.make_block_ptr(
-                V_ptr + batch_index * stride_vb,
-                shape=(N_KEYS, D),
-                strides=(stride_vk, stride_vd),
-                offsets=(k_start, 0),
-                block_shape=(K_TILE_SIZE, D),
-                order=(1, 0),
-            )
+    V_block_ptr = tl.make_block_ptr(
+    V_ptr + batch_index * stride_vb,
+    shape=(N_KEYS, D),
+    strides=(stride_vk, stride_vd),
+    offsets=(0, 0),
+    block_shape=(K_TILE_SIZE, D),
+    order=(1, 0),
+    )
 
-            k = tl.load(K_block_ptr)
-            v = tl.load(V_block_ptr)
+    m_i = tl.full((Q_TILE_SIZE,), value=float('-inf'), dtype=tl.float32)
+    l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    Q_i = tl.load(Q_block_ptr, boundary_check=(0,1), padding_option="zero")
+    O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    idx_q_base = tl.arange(0, Q_TILE_SIZE)
+    idx_k_base = tl.arange(0, K_TILE_SIZE)
+    idx_q = idx_q_base + Q_TILE_SIZE*query_tile_index
+    mask_scale = -1e6
 
-            s_ij = tl.dot(q, tl.trans(k)) * scale
+    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        K_j = tl.load(K_block_ptr, boundary_check=(0,1), padding_option="zero")
+        V_j = tl.load(V_block_ptr, boundary_check=(0,1), padding_option="zero")
+        S = tl.dot(Q_i,tl.trans(K_j))*scale
+        if is_causal:
+            idx_k = idx_k_base + j*K_TILE_SIZE
+            mask = mask_scale*(idx_k[None,:] > idx_q[:,None])
+            S += mask
+        m_i_new = tl.maximum(m_i, tl.max(S, axis=-1))
+        tildeP = tl.exp(S - m_i_new[:, None])
+        exp_scale = tl.exp(m_i - m_i_new)
+        l_i = exp_scale*l_i + tl.sum(tildeP, axis=-1)
+        O_i = O_i*exp_scale[:, None]
+        O_i += tl.dot(tildeP.to(V_j.dtype), V_j)
+        m_i = m_i_new
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-            if is_causal:
-                q_idx = q_start + tl.arange(0, Q_TILE_SIZE)[:, None]
-                k_idx = k_start + tl.arange(0, K_TILE_SIZE)[None, :]
-                causal_mask = q_idx >= k_idx
-                s_ij = tl.where(causal_mask, s_ij, -1e6)
-
-            m_ij = tl.max(s_ij, axis=1)
-            p_ij = tl.exp(s_ij - m_ij[:, None])
-            l_ij = tl.sum(p_ij, axis=1)
-
-            m_new = tl.maximum(m_i, m_ij)
-            alpha = tl.exp(m_i - m_new)
-            beta = tl.exp(m_ij - m_new)
-            l_new = alpha * l_i + beta * l_ij
-
-            p_cast = p_ij.to(v.dtype)
-            pv = tl.dot(p_cast, v, acc=tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32))
-
-            o_i = (alpha * l_i / l_new)[:, None] * o_i + (beta / l_new)[:, None] * pv
-
-            m_i = m_new
-            l_i = l_new
-
-        O_block_ptr = tl.make_block_ptr(
-            O_ptr + batch_index * stride_ob,
-            shape=(N_QUERIES, D),
-            strides=(stride_oq, stride_od),
-            offsets=(q_start, 0),
-            block_shape=(Q_TILE_SIZE, D),
-            order=(1, 0),
-        )
-        tl.store(O_block_ptr, o_i.to(O_block_ptr.type.element_ty))
-
-        l_ptrs = L_ptr + batch_index * stride_lb + q_start * stride_lq + tl.arange(0, Q_TILE_SIZE) * stride_lq
-        tl.store(l_ptrs, m_i + tl.log(l_i))
-
-    _flash_fwd_kernel = flash_fwd_kernel
-    return _flash_fwd_kernel
+    O_i = O_i / l_i[:, None]
+    l_i = m_i + tl.log(l_i)
+    tl.store(O_block_ptr, O_i, boundary_check=(0,1))
+    tl.store(L_block_ptr, l_i, boundary_check=(0,))
 
 
-class FlashAttention2AutogradFunctionTriton(torch.autograd.Function):
+@torch.compile
+def flash_attention_backward(Q, K, V, L, O, dO, sqrt_d, is_causal):
+    D = (O * dO).sum(dim=-1, keepdim=True)
+    S = einsum(Q, K, "... i d, ... j d -> ... i j")/sqrt_d
+    if is_causal:
+        i = torch.arange(S.shape[-2], device=S.device)
+        mask = i[None, :] > i[:, None]
+        S = S.masked_fill(mask, float("-inf"))
+    P = torch.exp(S - L.unsqueeze(-1))
+    dV = einsum(P, dO, "... i j, ... i d -> ... j d")
+    dP = einsum(dO, V, "... i d, ... j d -> ... i j")
+    dS = P * (dP - D)
+    dQ = einsum(dS, K, "... a b, ... b c-> ... a c")/sqrt_d
+    dK = einsum(dS, Q, "... a b, ... a d -> ... b d")/sqrt_d
+
+    return dQ, dK, dV, None
+
+
+class FlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(
-        ctx,
-        Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        _ensure_triton_loaded()
-
-        if not Q.is_cuda:
-            raise ValueError("FlashAttention2AutogradFunctionTriton expects CUDA tensors.")
-
-        batch_size, n_queries, d = Q.shape
-        n_keys = K.shape[-2]
-
-        q_tile_size = 16
-        k_tile_size = 16
-
-        O = torch.empty_like(Q)
-        L = torch.empty((batch_size, n_queries), device=Q.device, dtype=torch.float32)
-        flash_fwd_kernel = _get_flash_fwd_kernel()
-
-        grid = (triton.cdiv(n_queries, q_tile_size), batch_size)
-        flash_fwd_kernel[grid](
-            Q,
-            K,
-            V,
-            O,
-            L,
-            Q.stride(0),
-            Q.stride(1),
-            Q.stride(2),
-            K.stride(0),
-            K.stride(1),
-            K.stride(2),
-            V.stride(0),
-            V.stride(1),
-            V.stride(2),
-            O.stride(0),
-            O.stride(1),
-            O.stride(2),
-            L.stride(0),
-            L.stride(1),
-            n_queries,
-            n_keys,
-            d ** -0.5,
-            is_causal=bool(is_causal),
-            D=d,
-            Q_TILE_SIZE=q_tile_size,
-            K_TILE_SIZE=k_tile_size,
-        )
-
-        ctx.save_for_backward(L, Q, K, V, O)
+    def forward(ctx, Q : torch.Tensor ,K : torch.Tensor,V : torch.Tensor, is_causal : tl.constexpr=False):
+        B_q = B_k = 16
+        # B_k = 1
+        T_q = triton.cdiv(Q.shape[-2], B_q)
+        d = Q.shape[-1]
+        device = "cuda"
+        # O_i = torch.empty(*Q.shape[:-2],B_q, d, device= device)
+        O = torch.empty(Q.shape, device=Q.device)
+        L = torch.empty(Q.shape[:-1], device=Q.device)
+        batch_size = Q.shape[0]
+        N_QUERIES = Q.shape[-2]
+        N_KEYS = K.shape[-2]
+        scale = 1/math.sqrt(d)
+        Q_TILE_SIZE = B_q
+        K_TILE_SIZE = B_k
+        D = d
+        stride_qb = Q.stride(0)
+        stride_qq = Q.stride(1)
+        stride_qd = Q.stride(2)
+        stride_kb = K.stride(0)
+        stride_kk = K.stride(1)
+        stride_kd = K.stride(2)
+        stride_vb = V.stride(0)
+        stride_vk = V.stride(1)
+        stride_vd = V.stride(2)
+        stride_ob = O.stride(0)
+        stride_oq = O.stride(1)
+        stride_od = O.stride(2)
+        stride_lb = L.stride(0)
+        stride_lq = L.stride(1)
+        flash_fwd_kernel[(T_q, batch_size)](
+            Q, K, V,
+            O, L,
+            stride_qb, stride_qq, stride_qd,
+            stride_kb, stride_kk, stride_kd,
+            stride_vb, stride_vk, stride_vd,
+            stride_ob, stride_oq, stride_od,
+            stride_lb, stride_lq,
+            N_QUERIES, N_KEYS,
+            scale,
+            D,
+            Q_TILE_SIZE,
+            K_TILE_SIZE,
+            is_causal
+            )
+        ctx.save_for_backward(Q,K,V,L,O)
         ctx.is_causal = is_causal
+        ctx.sqrt_d = math.sqrt(d)
         return O
-
     @staticmethod
-    def backward(ctx, dO: torch.Tensor):
-        L, Q, K, V, O = ctx.saved_tensors
-        dQ, dK, dV = flash_attention_backward(Q, K, V, O, dO, L, bool(ctx.is_causal))
-        return dQ, dK, dV, None
+    def backward(ctx, dO):
+        Q, K, V, L, O = ctx.saved_tensors
+        return flash_attention_backward(Q, K, V, L, O, dO, ctx.sqrt_d, ctx.is_causal)
