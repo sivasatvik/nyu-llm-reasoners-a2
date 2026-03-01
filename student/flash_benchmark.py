@@ -41,6 +41,12 @@ class BenchResult:
     end_to_end_ms: float
 
 
+def _to_ms(bench_result) -> float:
+    if isinstance(bench_result, (tuple, list)):
+        return float(bench_result[0])
+    return float(bench_result)
+
+
 def _bench_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl: str, is_causal: bool) -> tuple[float, float, float]:
     if triton is None:
         raise RuntimeError("Triton is required for this benchmark script because it uses triton.testing.do_bench")
@@ -70,7 +76,7 @@ def _bench_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl: str, is
             out = regular_attention(q, k, v, is_causal)
             out.backward(do, retain_graph=False)
 
-    fwd_ms = triton.testing.do_bench(lambda: fwd(), quantiles=[0.5])[0]
+    fwd_ms = _to_ms(triton.testing.do_bench(lambda: fwd(), quantiles=[0.5]))
 
     def _bwd_wrapper():
         q.grad = None
@@ -78,7 +84,7 @@ def _bench_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl: str, is
         v.grad = None
         bwd()
 
-    bwd_ms = triton.testing.do_bench(lambda: _bwd_wrapper(), quantiles=[0.5])[0]
+    bwd_ms = _to_ms(triton.testing.do_bench(lambda: _bwd_wrapper(), quantiles=[0.5]))
 
     def _e2e_wrapper():
         q.grad = None
@@ -86,7 +92,7 @@ def _bench_impl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, impl: str, is
         v.grad = None
         e2e()
 
-    e2e_ms = triton.testing.do_bench(lambda: _e2e_wrapper(), quantiles=[0.5])[0]
+    e2e_ms = _to_ms(triton.testing.do_bench(lambda: _e2e_wrapper(), quantiles=[0.5]))
     return fwd_ms, bwd_ms, e2e_ms
 
 
