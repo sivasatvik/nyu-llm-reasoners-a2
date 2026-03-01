@@ -4,7 +4,6 @@ from __future__ import annotations
 import torch
 
 from student.flash_backward import flash_attention_backward
-from student.flash_pytorch import flash_attention2_forward_pytorch
 triton = None
 tl = None
 _flash_fwd_kernel = None
@@ -17,10 +16,11 @@ def _ensure_triton_loaded() -> None:
     try:
         import triton as _triton
         import triton.language as _tl
-    except Exception:
-        triton = None
-        tl = None
-        return
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to initialize Triton runtime. Ensure both `triton` and `setuptools` are installed "
+            "in the same environment used by pytest (e.g., `uv pip install setuptools triton`)."
+        ) from exc
 
     triton = _triton
     tl = _tl
@@ -155,12 +155,6 @@ class FlashAttention2AutogradFunctionTriton(torch.autograd.Function):
         is_causal: bool = False,
     ) -> torch.Tensor:
         _ensure_triton_loaded()
-
-        if triton is None or tl is None:
-            O, L = flash_attention2_forward_pytorch(Q, K, V, is_causal=is_causal)
-            ctx.save_for_backward(L, Q, K, V, O)
-            ctx.is_causal = is_causal
-            return O
 
         if not Q.is_cuda:
             raise ValueError("FlashAttention2AutogradFunctionTriton expects CUDA tensors.")
