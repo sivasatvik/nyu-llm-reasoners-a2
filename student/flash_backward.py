@@ -59,6 +59,10 @@ def flash_attention_backward(
                 _COMPILED_BACKWARD = torch.compile(_flash_backward_impl)
             except Exception:
                 _COMPILED_BACKWARD = _flash_backward_impl
-        return _COMPILED_BACKWARD(Q, K, V, O, dO, L, is_causal)
+        try:
+            return _COMPILED_BACKWARD(Q, K, V, O, dO, L, is_causal)
+        except Exception:
+            _COMPILED_BACKWARD = _flash_backward_impl
+            return _COMPILED_BACKWARD(Q, K, V, O, dO, L, is_causal)
 
     return _flash_backward_impl(Q, K, V, O, dO, L, is_causal)
