@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import importlib
+import json
 import sys
 import timeit
 from dataclasses import dataclass
@@ -83,9 +84,13 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--wandb-project", type=str, default="nyu-llm-reasoners-a2-benchmarks")
 	parser.add_argument("--wandb-entity", type=str, default="sm12779-new-york-university")
 	parser.add_argument("--wandb-run-name", type=str, default=None)
+	parser.add_argument("--results-json-out", type=str, default=None)
 	parser.add_argument("--custom-attention", action="store_true", help="Use custom annotated scaled dot product attention from utils.py")
 	parser.add_argument("--optimizer-step", action="store_true", help="Run optimizer.step() after backward pass in forward-backward mode")
 	parser.add_argument("--mixed-precision-bf16", action="store_true", help="Run model with FP32 params and BF16 autocast on CUDA")
+	parser.add_argument("--memory-profile", action="store_true", help="Record CUDA memory history and dump a snapshot pickle")
+	parser.add_argument("--memory-snapshot-out", type=str, default="memory_snapshot.pickle")
+	parser.add_argument("--memory-max-entries", type=int, default=1_000_000)
 
 	return parser.parse_args()
 
@@ -138,6 +143,8 @@ def _validate_args(args: argparse.Namespace, spec: ModelSpec, device: torch.devi
 		raise ValueError("--optimizer-step can only be used with --mode forward-backward")
 	if args.mixed_precision_bf16 and device.type != "cuda":
 		raise ValueError("--mixed-precision-bf16 is only supported on CUDA")
+	if args.memory_profile and device.type != "cuda":
+		raise ValueError("--memory-profile is only supported on CUDA")
 
 
 def _build_model(args: argparse.Namespace, spec: ModelSpec, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
@@ -248,15 +255,27 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 				_single_step(model, x, y, args.mode, device, autocast_context, optimizer=optimizer)
 
 	step_times: list[float] = []
-	with nvtx.range("benchmark_steps"):
-		for step_idx in range(args.benchmark_steps):
-			with nvtx.range(f"benchmark_step_{step_idx + 1}"):
-				if args.mode == "forward-backward":
-					model.zero_grad(set_to_none=True)
-				start = timeit.default_timer()
-				_single_step(model, x, y, args.mode, device, autocast_context, optimizer=optimizer)
-				end = timeit.default_timer()
-				step_times.append(end - start)
+	memory_snapshot_path = None
+	if args.memory_profile:
+		if not hasattr(torch.cuda, "memory") or not hasattr(torch.cuda.memory, "_record_memory_history"):
+			raise RuntimeError("This PyTorch build does not support torch.cuda.memory._record_memory_history")
+		torch.cuda.memory._record_memory_history(max_entries=args.memory_max_entries)
+
+	try:
+		with nvtx.range("benchmark_steps"):
+			for step_idx in range(args.benchmark_steps):
+				with nvtx.range(f"benchmark_step_{step_idx + 1}"):
+					if args.mode == "forward-backward":
+						model.zero_grad(set_to_none=True)
+					start = timeit.default_timer()
+					_single_step(model, x, y, args.mode, device, autocast_context, optimizer=optimizer)
+					end = timeit.default_timer()
+					step_times.append(end - start)
+	finally:
+		if args.memory_profile:
+			memory_snapshot_path = str(Path(args.memory_snapshot_out))
+			torch.cuda.memory._dump_snapshot(memory_snapshot_path)
+			torch.cuda.memory._record_memory_history(enabled=None)
 
 	total_seconds = sum(step_times)
 	mean_seconds = total_seconds / len(step_times)
@@ -279,6 +298,8 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 		"dtype": args.dtype,
 		"model_param_dtype": str(model_dtype).replace("torch.", ""),
 		"mixed_precision_bf16": args.mixed_precision_bf16,
+		"memory_profile": args.memory_profile,
+		"memory_snapshot_path": memory_snapshot_path or "",
 		"mode": args.mode,
 		"model_size": args.model_size,
 		"d_model": spec.d_model,
@@ -321,7 +342,10 @@ def _build_observations_table(step_times_ms: list[float]) -> pd.DataFrame:
 
 
 def _emit_observations_tables(observations_df: pd.DataFrame, markdown_out: str | None, latex_out: str | None) -> None:
-	markdown_table = observations_df.to_markdown(index=False, floatfmt=".4f")
+	try:
+		markdown_table = observations_df.to_markdown(index=False, floatfmt=".4f")
+	except ModuleNotFoundError:
+		markdown_table = observations_df.to_string(index=False)
 	latex_table = observations_df.to_latex(index=False, float_format="%.4f")
 
 	print("\n=== Observations (Markdown) ===")
@@ -395,10 +419,17 @@ def _print_results(results: dict[str, float | int | str]) -> None:
 			print(f"{key:>18}: {value}")
 
 
+def _emit_results_json(results: dict[str, float | int | str], results_json_out: str | None) -> None:
+	if not results_json_out:
+		return
+	Path(results_json_out).write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> None:
 	args = parse_args()
 	results, step_times_ms = run_benchmark(args)
 	_print_results(results)
+	_emit_results_json(results, args.results_json_out)
 	observations_df = _build_observations_table(step_times_ms)
 	_emit_observations_tables(observations_df, args.markdown_out, args.latex_out)
 	_log_to_wandb(args, results, step_times_ms, observations_df)
