@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import importlib
 import sys
 import timeit
@@ -74,7 +75,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--benchmark-steps", type=int, default=10)
 
 	parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
-	parser.add_argument("--dtype", choices=list(DTYPE_CHOICES), default="bfloat16")
+	parser.add_argument("--dtype", choices=list(DTYPE_CHOICES), default="float32")
 	parser.add_argument("--seed", type=int, default=42)
 	parser.add_argument("--markdown-out", type=str, default=None)
 	parser.add_argument("--latex-out", type=str, default=None)
@@ -84,6 +85,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--wandb-run-name", type=str, default=None)
 	parser.add_argument("--custom-attention", action="store_true", help="Use custom annotated scaled dot product attention from utils.py")
 	parser.add_argument("--optimizer-step", action="store_true", help="Run optimizer.step() after backward pass in forward-backward mode")
+	parser.add_argument("--mixed-precision-bf16", action="store_true", help="Run model with FP32 params and BF16 autocast on CUDA")
 
 	return parser.parse_args()
 
@@ -134,6 +136,8 @@ def _validate_args(args: argparse.Namespace, spec: ModelSpec, device: torch.devi
 		raise ValueError("float16 on CPU is not supported for this benchmark. Use float32 or bfloat16.")
 	if args.optimizer_step and args.mode != "forward-backward":
 		raise ValueError("--optimizer-step can only be used with --mode forward-backward")
+	if args.mixed_precision_bf16 and device.type != "cuda":
+		raise ValueError("--mixed-precision-bf16 is only supported on CUDA")
 
 
 def _build_model(args: argparse.Namespace, spec: ModelSpec, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
@@ -179,20 +183,24 @@ def _single_step(
 	y: torch.Tensor,
 	mode: str,
 	device: torch.device,
+	autocast_context,
 	optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
 	if mode == "forward":
 		with nvtx.range("forward_pass"):
 			with torch.no_grad():
-				_ = model(x)
+				with autocast_context:
+					_ = model(x)
 		_synchronize_if_cuda(device)
 		return
 
 	with nvtx.range("forward_pass"):
-		logits = model(x)
+		with autocast_context:
+			logits = model(x)
 
 	with nvtx.range("compute_loss"):
-		loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+		with autocast_context:
+			loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
 
 	with nvtx.range("backward_pass"):
 		loss.backward()
@@ -212,13 +220,19 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 	dtype = DTYPE_CHOICES[args.dtype]
 	spec = _resolve_model_spec(args)
 	_validate_args(args, spec, device, dtype)
+	model_dtype = torch.float32 if args.mixed_precision_bf16 else dtype
+	autocast_context = (
+		torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+		if args.mixed_precision_bf16
+		else nullcontext()
+	)
 
 	torch.manual_seed(args.seed)
 	if device.type == "cuda":
 		torch.cuda.manual_seed_all(args.seed)
 		torch.cuda.reset_peak_memory_stats(device)
 
-	model = _build_model(args, spec, device, dtype)
+	model = _build_model(args, spec, device, model_dtype)
 	optimizer: torch.optim.Optimizer | None = None
 	if args.optimizer_step:
 		optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -231,7 +245,7 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 			with nvtx.range(f"warmup_step_{warmup_idx + 1}"):
 				if args.mode == "forward-backward":
 					model.zero_grad(set_to_none=True)
-				_single_step(model, x, y, args.mode, device, optimizer=optimizer)
+				_single_step(model, x, y, args.mode, device, autocast_context, optimizer=optimizer)
 
 	step_times: list[float] = []
 	with nvtx.range("benchmark_steps"):
@@ -240,7 +254,7 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 				if args.mode == "forward-backward":
 					model.zero_grad(set_to_none=True)
 				start = timeit.default_timer()
-				_single_step(model, x, y, args.mode, device, optimizer=optimizer)
+				_single_step(model, x, y, args.mode, device, autocast_context, optimizer=optimizer)
 				end = timeit.default_timer()
 				step_times.append(end - start)
 
@@ -263,6 +277,8 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 	results = {
 		"device": str(device),
 		"dtype": args.dtype,
+		"model_param_dtype": str(model_dtype).replace("torch.", ""),
+		"mixed_precision_bf16": args.mixed_precision_bf16,
 		"mode": args.mode,
 		"model_size": args.model_size,
 		"d_model": spec.d_model,
@@ -348,6 +364,7 @@ def _log_to_wandb(
 			"warmup_steps": args.warmup_steps,
 			"benchmark_steps": args.benchmark_steps,
 			"optimizer_step": args.optimizer_step,
+			"mixed_precision_bf16": args.mixed_precision_bf16,
 			"device": args.device,
 			"dtype": args.dtype,
 			"seed": args.seed,
