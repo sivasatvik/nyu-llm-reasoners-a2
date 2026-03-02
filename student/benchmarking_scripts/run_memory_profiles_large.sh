@@ -20,7 +20,7 @@ COMMON_ARGS=(
   --model-size large
   --device cuda
   --dtype float32
-  --warmup-steps 2
+  --warmup-steps 5
   --benchmark-steps 5
   --memory-profile
 )
