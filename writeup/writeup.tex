@@ -118,11 +118,54 @@
             \end{itemize}
         \item [1.1.6] \textbf{memory\_profiling}
             \begin{enumerate}[label=\alph*.]
-                \item
-                \item
-                \item
-                \item
-                \item
+                \item The following two images are the memory profiles for the forward pass and the full training step (forward+backward+optimizer) for the large model at context length 512. The memory usage is significantly higher for the full training step compared to the forward pass alone, which is expected since the backward pass and optimizer steps require additional memory for storing gradients and optimizer states. The peaks in memory usage correspond to the points in the computation where large intermediate tensors are created, such as during matrix multiplications in the transformer blocks. The memory profile also shows that the memory usage is relatively stable during the forward pass, while it fluctuates more during the full training step due to the additional computations and memory allocations involved in the backward pass and optimization steps.
+                    \begin{center}
+                        \includegraphics[width=0.8\textwidth]{../charts/large_forward_pass_memory_profile.png}
+                    \end{center}
+                    \begin{center}
+                        \includegraphics[width=0.8\textwidth]{../charts/large_full_training_step_memory_profile.png}
+                    \end{center}
+                \item Peak memory usage table is given below
+                    \begin{table}[h]
+                        \centering
+                            \begin{tabular}{|r|r|r|}
+                                \hline
+                                context\_length & Forward pass peak memory & Full Training step peak memory\\
+                                \hline
+                                128 & 3.7 GiB & 17.8 GiB \\
+                                \hline
+                                256 & 3.7 GiB & 18.1 GiB \\
+                                \hline
+                                512 & 4.0 GiB & 27.4 GiB \\
+                                \hline
+                            \end{tabular}
+                    \end{table}
+                \item Peak memory usage table for mixed precision is given below
+                    \begin{table}[h]
+                        \centering
+                            \begin{tabular}{|r|r|r|}
+                                \hline
+                                context\_length & Forward pass peak memory & Full Training step peak memory\\
+                                \hline
+                                128 & 5.4 GiB & 18.1 GiB \\
+                                \hline
+                                256 & 5.4 GiB & 18.1 GiB \\
+                                \hline
+                                512 & 5.6 GiB & 23.7 GiB \\
+                                \hline
+                            \end{tabular}
+                    \end{table}
+                    \newline
+                    The peak memory usage for the forward pass is higher in mixed precision compared to pure float32 precision. This is because in mixed precision, some tensors are stored in lower precision (like float16 or bfloat16) which can lead to increased memory fragmentation and overhead from storing additional metadata for managing different data types. However, the peak memory usage for the full training step is lower in mixed precision compared to pure float32 precision. This is because mixed precision allows for reduced memory bandwidth and faster computation, which can lead to more efficient use of memory during the backward pass and optimization steps, ultimately resulting in lower overall memory usage compared to pure float32 precision.
+                \item The size of a tensor of activations in the Transformer residual stream, in single precision, for large model with context length 512 is around 80 MiB. This is calculated based on the dimensions of the tensor (batch size, sequence length, hidden size) and the data type (float32) used for storing the activations. The memory usage can be computed as: 
+                    \begin{align*}
+                        \text{Memory Usage} = \text{Batch Size} \times \text{Sequence Length} \times \text{Hidden Size} \times \text{Bytes per Element}
+                    \end{align*}
+                    For example, here the batch size is 4, sequence length is 512, hidden size is 1280, and each float32 element takes 4 bytes, the memory usage would be:
+                    \begin{align*}
+                        4 \times 512 \times 1280 \times 4 = 10,485,760 \text{ bytes} = \mathbf{10} \text{ MB}
+                    \end{align*}
+                \item For large model with context length 512, the size of the largest allocations during the forward pass is around \textbf{80 MiB}. Looking at the stacktrace, the allocation came from \textbf{`scaled\_dot\_product\_attention'} function, which is responsible for computing the attention scores and applying the attention mechanism in the transformer block. The large allocation is likely due to the need to store intermediate tensors for the attention computation, such as the query, key, value matrices and the resulting attention weights, which can be quite large given the dimensions of the model and the context length.
             \end{enumerate}
     \end{enumerate} 
 \end{enumerate}
