@@ -4,6 +4,7 @@ import argparse
 import math
 import statistics
 import timeit
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,6 +71,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark.")
 
+    print(f"Running attention scaling benchmark on device: {args.device}")
     device = torch.device(args.device)
     dtype = torch.float32
     bytes_per_elem = torch.finfo(dtype).bits // 8
@@ -86,6 +88,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
     for d_model in d_models:
         for seq_len in seq_lens:
+            print(f"\n[config] d_model={d_model}, seq_len={seq_len}, batch={args.batch_size}", flush=True)
             qkv_mib, scores_mib, probs_mib, output_mib, saved_backward_est_mib = _estimate_memory_mib(
                 args.batch_size,
                 seq_len,
@@ -97,16 +100,19 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
             torch.cuda.reset_peak_memory_stats(device)
 
             try:
+                print("  [stage] allocate Q/K/V", flush=True)
                 Q = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
                 K = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
                 V = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
 
                 # Warmup forward
+                print(f"  [stage] warmup forward x{args.warmup_steps}", flush=True)
                 for _ in range(args.warmup_steps):
                     _ = annotated_scaled_dot_product_attention(Q, K, V)
                     torch.cuda.synchronize(device)
 
                 forward_times_ms: list[float] = []
+                print(f"  [stage] timed forward x{args.iters}", flush=True)
                 for _ in range(args.iters):
                     start = timeit.default_timer()
                     _ = annotated_scaled_dot_product_attention(Q, K, V)
@@ -115,9 +121,11 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     forward_times_ms.append((end - start) * 1000.0)
 
                 torch.cuda.synchronize(device)
+                print("  [stage] memory sample after forward", flush=True)
                 memory_after_forward_before_backward_warmup_mib = torch.cuda.memory_allocated(device) / (1024**2)
 
                 # Warmup backward
+                print(f"  [stage] warmup backward x{args.warmup_steps}", flush=True)
                 for _ in range(args.warmup_steps):
                     if Q.grad is not None:
                         Q.grad = None
@@ -129,6 +137,7 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     torch.cuda.synchronize(device)
 
                 backward_times_ms: list[float] = []
+                print(f"  [stage] timed backward x{args.iters}", flush=True)
                 for _ in range(args.iters):
                     if Q.grad is not None:
                         Q.grad = None
@@ -144,6 +153,8 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                     torch.cuda.synchronize(device)
                     end = timeit.default_timer()
                     backward_times_ms.append((end - start) * 1000.0)
+
+                print("  [stage] done", flush=True)
 
                 rows.append(
                     Row(
@@ -164,7 +175,10 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
                 )
             except RuntimeError as exc:
                 if "out of memory" not in str(exc).lower():
+                    print(f"  [error] RuntimeError at d_model={d_model}, seq_len={seq_len}: {exc}", flush=True)
+                    traceback.print_exc()
                     raise
+                print(f"  [oom] d_model={d_model}, seq_len={seq_len}", flush=True)
                 torch.cuda.empty_cache()
                 rows.append(
                     Row(
