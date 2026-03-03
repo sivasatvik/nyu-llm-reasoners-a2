@@ -75,12 +75,9 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
     bytes_per_elem = torch.finfo(dtype).bits // 8
 
     # Eagerly initialize CUDA primary context + cuBLAS handle to avoid lazy-init warnings.
-    torch.cuda.set_device(device)
-    torch.cuda.init()
-    # _ctx_a = torch.randn(1, 1, device=device, dtype=dtype)
-    # _ctx_b = torch.randn(1, 1, device=device, dtype=dtype)
-    # _ = _ctx_a @ _ctx_b
-    # torch.cuda.synchronize(device)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    torch.cuda.reset_peak_memory_stats(device)
 
     d_models = _parse_int_list(args.d_models)
     seq_lens = _parse_int_list(args.seq_lens)
