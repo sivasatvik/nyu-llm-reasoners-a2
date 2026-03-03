@@ -196,7 +196,7 @@
                         }
                     \end{table}
                 \newpage
-                \item The table for uncompiled vs compiled version of the model is given below. The forward pass times for the compiled version are somewhat lower than the uncompiled version across all model sizes, which is expected since PyTorch's compilation can optimize the computation graph and fuse operations to improve performance. The forward+backward pass times for the compiled version are also somewhat lower than the uncompiled version across all model sizes, which is also expected since the optimizations from compilation can benefit both forward and backward computations. However, the performance improvement from compilation may not be very significant for smaller models, but it becomes more pronounced as the model size increases due to the larger computational load and greater opportunities for optimization.
+                \item The table for uncompiled vs compiled version of the model is given below. The forward pass times for the compiled version are somewhat lower than the uncompiled version across all model sizes. The forward+backward pass times for the compiled version are a somewhat higher than the uncompiled version for smaller models but they are somewhat lower as the model size increases, which is also expected since the optimizations from compilation can benefit both forward and backward computations. When optimizer step is also included, the run times are very close for both compiled and uncompiled versions across all model sizes, with the compiled version being slightly higher for smaller models and slightly lower for larger models. This could be because the optimizer step may not benefit as much from compilation optimizations as the forward and backward passes do. Overall, the performance difference between compiled and uncompiled versions is not very significant, but there is a trend of improved performance with compilation as the model size increases. For xl and 2.7B models, the run with optimizer step is giving oom errors, hence not included in the table.
                     \begin{table}[h]
                         \centering
                             \begin{tabular}{|r|r|r|r|r|}
@@ -211,6 +211,10 @@
                                 \hline
                                 compiled & small & forward+backward & 86.9557 & 0.3059 \\
                                 \hline
+                                uncompiled & small & forward+backward+optimizer\_step & 93.0815 & 0.5335  \\
+                                \hline
+                                compiled & small & forward+backward+optimizer\_step & 95.7967 & 1.0436 \\
+                                \hline
                                 uncompiled & medium & forward & 71.0755 & 3.2061  \\
                                 \hline
                                 compiled & medium & forward & 62.1534 & 2.7001  \\
@@ -219,6 +223,10 @@
                                 \hline
                                 compiled & medium & forward+backward & 220.9293 & 1.1892  \\
                                 \hline
+                                uncompiled & medium & forward+backward+optimizer\_step & 243.2726 & 0.6310  \\
+                                \hline
+                                compiled & medium & forward+backward+optimizer\_step & 244.3076 & 3.1609  \\
+                                \hline
                                 uncompiled & large & forward & 141.2933 & 0.1184 \\
                                 \hline
                                 compiled & large & forward & 128.7720 & 0.0764 \\
@@ -226,6 +234,10 @@
                                 uncompiled & large & forward+backward & 436.3411 & 0.3570  \\
                                 \hline
                                 compiled & large & forward+backward & 416.8952 & 0.9826  \\
+                                \hline
+                                uncompiled & large & forward+backward+optimizer\_step & 498.9632 & 0.0770  \\
+                                \hline
+                                compiled & large & forward+backward+optimizer\_step & 479.9749 & 1.5860  \\
                                 \hline
                                 uncompiled & xl & forward & 280.6156 & 0.0603 \\
                                 \hline
