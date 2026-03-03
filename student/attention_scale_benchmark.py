@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import statistics
 import timeit
 import traceback
@@ -20,6 +19,7 @@ def _parse_int_list(value: str) -> list[int]:
 
 @dataclass
 class Row:
+    implementation: str
     d_model: int
     seq_len: int
     status: str
@@ -83,120 +83,132 @@ def run(args: argparse.Namespace) -> pd.DataFrame:
 
     d_models = _parse_int_list(args.d_models)
     seq_lens = _parse_int_list(args.seq_lens)
+    implementations = ["uncompiled", "compiled"] if args.include_compiled else ["uncompiled"]
 
     rows: list[Row] = []
 
-    for d_model in d_models:
-        for seq_len in seq_lens:
-            print(f"\n[config] d_model={d_model}, seq_len={seq_len}, batch={args.batch_size}", flush=True)
-            qkv_mib, scores_mib, probs_mib, output_mib, saved_backward_est_mib = _estimate_memory_mib(
-                args.batch_size,
-                seq_len,
-                d_model,
-                bytes_per_elem,
-            )
+    for implementation in implementations:
+        if implementation == "compiled":
+            if not hasattr(torch, "compile"):
+                print("[skip] torch.compile unavailable in this PyTorch build", flush=True)
+                continue
+            attention_fn = torch.compile(annotated_scaled_dot_product_attention)
+        else:
+            attention_fn = annotated_scaled_dot_product_attention
 
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats(device)
-
-            try:
-                print("  [stage] allocate Q/K/V", flush=True)
-                Q = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
-                K = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
-                V = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
-
-                # Warmup forward
-                print(f"  [stage] warmup forward x{args.warmup_steps}", flush=True)
-                for _ in range(args.warmup_steps):
-                    _ = annotated_scaled_dot_product_attention(Q, K, V)
-                    torch.cuda.synchronize(device)
-
-                forward_times_ms: list[float] = []
-                print(f"  [stage] timed forward x{args.iters}", flush=True)
-                for _ in range(args.iters):
-                    start = timeit.default_timer()
-                    _ = annotated_scaled_dot_product_attention(Q, K, V)
-                    torch.cuda.synchronize(device)
-                    end = timeit.default_timer()
-                    forward_times_ms.append((end - start) * 1000.0)
-
-                torch.cuda.synchronize(device)
-                print("  [stage] memory sample after forward", flush=True)
-                memory_after_forward_before_backward_warmup_mib = torch.cuda.memory_allocated(device) / (1024**2)
-
-                # Warmup backward
-                print(f"  [stage] warmup backward x{args.warmup_steps}", flush=True)
-                for _ in range(args.warmup_steps):
-                    if Q.grad is not None:
-                        Q.grad = None
-                        K.grad = None
-                        V.grad = None
-                    out = annotated_scaled_dot_product_attention(Q, K, V)
-                    grad_out = torch.randn_like(out)
-                    out.backward(grad_out)
-                    torch.cuda.synchronize(device)
-
-                backward_times_ms: list[float] = []
-                print(f"  [stage] timed backward x{args.iters}", flush=True)
-                for _ in range(args.iters):
-                    if Q.grad is not None:
-                        Q.grad = None
-                        K.grad = None
-                        V.grad = None
-
-                    out = annotated_scaled_dot_product_attention(Q, K, V)
-                    torch.cuda.synchronize(device)
-
-                    grad_out = torch.randn_like(out)
-                    start = timeit.default_timer()
-                    out.backward(grad_out)
-                    torch.cuda.synchronize(device)
-                    end = timeit.default_timer()
-                    backward_times_ms.append((end - start) * 1000.0)
-
-                print("  [stage] done", flush=True)
-
-                rows.append(
-                    Row(
-                        d_model=d_model,
-                        seq_len=seq_len,
-                        status="ok",
-                        forward_mean_ms=statistics.mean(forward_times_ms),
-                        forward_std_ms=statistics.pstdev(forward_times_ms) if len(forward_times_ms) > 1 else 0.0,
-                        memory_after_forward_before_backward_warmup_mib=memory_after_forward_before_backward_warmup_mib,
-                        backward_mean_ms=statistics.mean(backward_times_ms),
-                        backward_std_ms=statistics.pstdev(backward_times_ms) if len(backward_times_ms) > 1 else 0.0,
-                        qkv_mib=qkv_mib,
-                        scores_mib=scores_mib,
-                        probs_mib=probs_mib,
-                        output_mib=output_mib,
-                        saved_backward_est_mib=saved_backward_est_mib,
-                    )
+        for d_model in d_models:
+            for seq_len in seq_lens:
+                print(f"\n[config] impl={implementation}, d_model={d_model}, seq_len={seq_len}, batch={args.batch_size}", flush=True)
+                qkv_mib, scores_mib, probs_mib, output_mib, saved_backward_est_mib = _estimate_memory_mib(
+                    args.batch_size,
+                    seq_len,
+                    d_model,
+                    bytes_per_elem,
                 )
-            except RuntimeError as exc:
-                if "out of memory" not in str(exc).lower():
-                    print(f"  [error] RuntimeError at d_model={d_model}, seq_len={seq_len}: {exc}", flush=True)
-                    traceback.print_exc()
-                    raise
-                print(f"  [oom] d_model={d_model}, seq_len={seq_len}", flush=True)
+
                 torch.cuda.empty_cache()
-                rows.append(
-                    Row(
-                        d_model=d_model,
-                        seq_len=seq_len,
-                        status="oom",
-                        forward_mean_ms=None,
-                        forward_std_ms=None,
-                        memory_after_forward_before_backward_warmup_mib=None,
-                        backward_mean_ms=None,
-                        backward_std_ms=None,
-                        qkv_mib=qkv_mib,
-                        scores_mib=scores_mib,
-                        probs_mib=probs_mib,
-                        output_mib=output_mib,
-                        saved_backward_est_mib=saved_backward_est_mib,
+                torch.cuda.reset_peak_memory_stats(device)
+
+                try:
+                    print("  [stage] allocate Q/K/V", flush=True)
+                    Q = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                    K = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+                    V = torch.randn(args.batch_size, seq_len, d_model, device=device, dtype=dtype, requires_grad=True)
+
+                    # Warmup forward
+                    print(f"  [stage] warmup forward x{args.warmup_steps}", flush=True)
+                    for _ in range(args.warmup_steps):
+                        _ = attention_fn(Q, K, V)
+                        torch.cuda.synchronize(device)
+
+                    forward_times_ms: list[float] = []
+                    print(f"  [stage] timed forward x{args.iters}", flush=True)
+                    for _ in range(args.iters):
+                        start = timeit.default_timer()
+                        _ = attention_fn(Q, K, V)
+                        torch.cuda.synchronize(device)
+                        end = timeit.default_timer()
+                        forward_times_ms.append((end - start) * 1000.0)
+
+                    torch.cuda.synchronize(device)
+                    print("  [stage] memory sample after forward", flush=True)
+                    memory_after_forward_before_backward_warmup_mib = torch.cuda.memory_allocated(device) / (1024**2)
+
+                    # Warmup backward
+                    print(f"  [stage] warmup backward x{args.warmup_steps}", flush=True)
+                    for _ in range(args.warmup_steps):
+                        if Q.grad is not None:
+                            Q.grad = None
+                            K.grad = None
+                            V.grad = None
+                        out = attention_fn(Q, K, V)
+                        grad_out = torch.randn_like(out)
+                        out.backward(grad_out)
+                        torch.cuda.synchronize(device)
+
+                    backward_times_ms: list[float] = []
+                    print(f"  [stage] timed backward x{args.iters}", flush=True)
+                    for _ in range(args.iters):
+                        if Q.grad is not None:
+                            Q.grad = None
+                            K.grad = None
+                            V.grad = None
+
+                        out = attention_fn(Q, K, V)
+                        torch.cuda.synchronize(device)
+
+                        grad_out = torch.randn_like(out)
+                        start = timeit.default_timer()
+                        out.backward(grad_out)
+                        torch.cuda.synchronize(device)
+                        end = timeit.default_timer()
+                        backward_times_ms.append((end - start) * 1000.0)
+
+                    print("  [stage] done", flush=True)
+
+                    rows.append(
+                        Row(
+                            implementation=implementation,
+                            d_model=d_model,
+                            seq_len=seq_len,
+                            status="ok",
+                            forward_mean_ms=statistics.mean(forward_times_ms),
+                            forward_std_ms=statistics.pstdev(forward_times_ms) if len(forward_times_ms) > 1 else 0.0,
+                            memory_after_forward_before_backward_warmup_mib=memory_after_forward_before_backward_warmup_mib,
+                            backward_mean_ms=statistics.mean(backward_times_ms),
+                            backward_std_ms=statistics.pstdev(backward_times_ms) if len(backward_times_ms) > 1 else 0.0,
+                            qkv_mib=qkv_mib,
+                            scores_mib=scores_mib,
+                            probs_mib=probs_mib,
+                            output_mib=output_mib,
+                            saved_backward_est_mib=saved_backward_est_mib,
+                        )
                     )
-                )
+                except RuntimeError as exc:
+                    if "out of memory" not in str(exc).lower():
+                        print(f"  [error] RuntimeError at impl={implementation}, d_model={d_model}, seq_len={seq_len}: {exc}", flush=True)
+                        traceback.print_exc()
+                        raise
+                    print(f"  [oom] impl={implementation}, d_model={d_model}, seq_len={seq_len}", flush=True)
+                    torch.cuda.empty_cache()
+                    rows.append(
+                        Row(
+                            implementation=implementation,
+                            d_model=d_model,
+                            seq_len=seq_len,
+                            status="oom",
+                            forward_mean_ms=None,
+                            forward_std_ms=None,
+                            memory_after_forward_before_backward_warmup_mib=None,
+                            backward_mean_ms=None,
+                            backward_std_ms=None,
+                            qkv_mib=qkv_mib,
+                            scores_mib=scores_mib,
+                            probs_mib=probs_mib,
+                            output_mib=output_mib,
+                            saved_backward_est_mib=saved_backward_est_mib,
+                        )
+                    )
 
     df = pd.DataFrame([r.__dict__ for r in rows])
     return df
@@ -210,6 +222,7 @@ def main() -> None:
     parser.add_argument("--seq-lens", type=str, default="256,1024,4096,8192,16384")
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--include-compiled", action="store_true", help="Also benchmark torch.compile version of attention")
     parser.add_argument("--csv-out", type=str, default="benchmark_results/attention_scale_benchmark.csv")
     parser.add_argument("--markdown-out", type=str, default="benchmark_results/attention_scale_benchmark.md")
     args = parser.parse_args()

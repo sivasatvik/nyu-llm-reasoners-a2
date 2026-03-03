@@ -1,6 +1,6 @@
 #!/bin/bash
 # Master script to submit all 10 benchmark jobs for small, medium, large, xl, 2.7B models
-# with both forward and forward-backward modes
+# with both forward and forward-backward modes, using torch.compile.
 
 set -euo pipefail
 
@@ -8,6 +8,7 @@ ACCOUNT="csci_ga_3033_131-2026sp"
 PARTITION="c12m85-a100-1"
 TIME="1:00:00"
 GPUS="1"
+WARMUP_STEPS="5"
 ENTITY="sm12779-new-york-university"
 PROJECT="nyu-llm-reasoners-a2-benchmarks"
 
@@ -19,14 +20,14 @@ submit_benchmark() {
     local model_size=$1
     local mode=$2
     local mode_name=$3
-    
-    local job_name="bench-${model_size}-${mode_name}"
-    local run_name="bench-${mode_name}-${model_size}"
-    local output_file="benchmark_table_${model_size}_${mode_name}.tex"
-    
+
+    local job_name="bench-compile-${model_size}-${mode_name}-warmup-${WARMUP_STEPS}"
+    local run_name="bench-compile-${mode_name}-${model_size}-warmup-${WARMUP_STEPS}"
+    local output_file="benchmark_table_${model_size}_${mode_name}_compile_warmup_${WARMUP_STEPS}.tex"
+
     # Create temporary sbatch file
     local sbatch_file="/tmp/${job_name}.sh"
-    
+
     cat > "$sbatch_file" << 'SBATCH_EOF'
 #!/bin/bash
 #SBATCH --job-name=JOB_NAME
@@ -51,14 +52,15 @@ python -m student.benchmark \
     --device cuda \
     --dtype float32 \
     --model-size MODEL_SIZE \
-    --warmup-steps 5 \
+    --warmup-steps WARMUP_STEPS \
     --benchmark-steps 10 \
     --mode MODE \
-	--latex-out OUTPUT_FILE \
-	--wandb \
+    --compile-model \
+    --latex-out OUTPUT_FILE \
+    --wandb \
     --wandb-run-name RUN_NAME \
     --wandb-entity ENTITY \
-	--wandb-project PROJECT
+    --wandb-project PROJECT
 "
 SBATCH_EOF
 
@@ -68,18 +70,19 @@ SBATCH_EOF
     sed -i "s|PARTITION|$PARTITION|g" "$sbatch_file"
     sed -i "s|TIME|$TIME|g" "$sbatch_file"
     sed -i "s|GPUS|$GPUS|g" "$sbatch_file"
+    sed -i "s|WARMUP_STEPS|$WARMUP_STEPS|g" "$sbatch_file"
     sed -i "s|MODEL_SIZE|$model_size|g" "$sbatch_file"
     sed -i "s|MODE|$mode|g" "$sbatch_file"
     sed -i "s|OUTPUT_FILE|$output_file|g" "$sbatch_file"
     sed -i "s|RUN_NAME|$run_name|g" "$sbatch_file"
     sed -i "s|ENTITY|$ENTITY|g" "$sbatch_file"
     sed -i "s|PROJECT|$PROJECT|g" "$sbatch_file"
-    
+
     # Submit the job and capture job ID
     echo "Submitting $job_name..."
     local job_id=$(sbatch "$sbatch_file" | awk '{print $NF}')
     echo "Job submitted with ID: $job_id"
-    
+
     # Wait for the job to complete
     echo "Waiting for job $job_id to complete..."
     while squeue -j "$job_id" &>/dev/null; do
@@ -87,13 +90,13 @@ SBATCH_EOF
     done
     echo "Job $job_id completed!"
     echo "---"
-    
+
     # Clean up temporary file
     rm "$sbatch_file"
 }
 
 echo "=========================================="
-echo "Submitting all benchmark jobs"
+echo "Submitting all compile benchmark jobs"
 echo "=========================================="
 
 # Submit all jobs
@@ -109,6 +112,6 @@ submit_benchmark "2.7B" "forward" "fwd"
 submit_benchmark "2.7B" "forward-backward" "fb"
 
 echo "=========================================="
-echo "All 10 jobs submitted!"
+echo "All 10 compile jobs submitted!"
 echo "Check job status with: squeue -u \$USER"
 echo "=========================================="

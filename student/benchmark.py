@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--results-json-out", type=str, default=None)
 	parser.add_argument("--custom-attention", action="store_true", help="Use custom annotated scaled dot product attention from utils.py")
 	parser.add_argument("--optimizer-step", action="store_true", help="Run optimizer.step() after backward pass in forward-backward mode")
+	parser.add_argument("--compile-model", action="store_true", help="Wrap model with torch.compile before benchmarking")
 	parser.add_argument("--mixed-precision-bf16", action="store_true", help="Run model with FP32 params and BF16 autocast on CUDA")
 	parser.add_argument("--memory-profile", action="store_true", help="Record CUDA memory history and dump a snapshot pickle")
 	parser.add_argument("--memory-snapshot-out", type=str, default="memory_snapshot.pickle")
@@ -240,6 +241,10 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 		torch.cuda.reset_peak_memory_stats(device)
 
 	model = _build_model(args, spec, device, model_dtype)
+	if args.compile_model:
+		if not hasattr(torch, "compile"):
+			raise RuntimeError("--compile-model was set, but torch.compile is not available in this PyTorch build")
+		model = torch.compile(model)
 	optimizer: torch.optim.Optimizer | None = None
 	if args.optimizer_step:
 		optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -312,6 +317,7 @@ def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, float | int | str
 		"benchmark_steps": args.benchmark_steps,
 		"custom_attention": args.custom_attention,
 		"optimizer_step": args.optimizer_step,
+		"compile_model": args.compile_model,
 		"mean_step_ms": mean_seconds * 1000.0,
 		"std_step_ms": std_seconds * 1000.0,
 		"total_time_s": total_seconds,
@@ -388,6 +394,7 @@ def _log_to_wandb(
 			"warmup_steps": args.warmup_steps,
 			"benchmark_steps": args.benchmark_steps,
 			"optimizer_step": args.optimizer_step,
+			"compile_model": args.compile_model,
 			"mixed_precision_bf16": args.mixed_precision_bf16,
 			"device": args.device,
 			"dtype": args.dtype,
