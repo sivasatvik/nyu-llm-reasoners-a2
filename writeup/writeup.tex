@@ -6,7 +6,15 @@
 \usepackage{amsmath}
 \usepackage{mathtools}
 \usepackage{booktabs}
-\usepackage{graphicx}
+\newif\iffastbuild
+\fastbuildtrue
+\iffastbuild
+    \usepackage[draft]{graphicx}
+\else
+    \usepackage{graphicx}
+\fi
+\usepackage{csvsimple}
+
 
 
 \begin{document}
@@ -20,7 +28,7 @@
     {\Large Assignment 2\par}
     \vspace{2cm}
     
-    {\Large\bfseries Building a Transformer LM\par}
+    {\Large\bfseries Systems and Parallelism\par}
     \vspace{3cm}
     
     {\Large Siva Satvik\par}
@@ -165,7 +173,78 @@
                     \begin{align*}
                         4 \times 512 \times 1280 \times 4 = 10,485,760 \text{ bytes} = \mathbf{10} \text{ MB}
                     \end{align*}
-                \item For large model with context length 512, the size of the largest allocations during the forward pass is around \textbf{80 MiB}. Looking at the stacktrace, the allocation came from \textbf{`scaled\_dot\_product\_attention'} function, which is responsible for computing the attention scores and applying the attention mechanism in the transformer block. The large allocation is likely due to the need to store intermediate tensors for the attention computation, such as the query, key, value matrices and the resulting attention weights, which can be quite large given the dimensions of the model and the context length.
+                \item For large model with context length 512, the size of the largest allocations during the forward pass is around \textbf{80 MiB}. Looking at the stacktrace, the allocation came from \texttt{scaled\_dot\_product \_attention} function, which is responsible for computing the attention scores and applying the attention mechanism in the transformer block. The large allocation is likely due to the need to store intermediate tensors for the attention computation, such as the query, key, value matrices and the resulting attention weights, which can be quite large given the dimensions of the model and the context length.
+            \end{enumerate}
+        \item [1.2.1] \textbf{pytorch\_attention}
+            \begin{enumerate}[label=\alph*.]
+                \item Attention scaling benchmark results are given below. The out of memory errors are seen for context length of 16384 across d\_model sizes. For d\_model size of 16 and context length of 16384, the memory for attention is around 16 GiB. This comes from the calculation of qkv, output and probability tensors. As the context length increases, the memory saved for backward pass increases significantly as seen in the table. To eliminate this memory cost, we can use techniques like gradient checkpointing, which allows us to recompute intermediate activations during the backward pass instead of storing them all in memory. This can significantly reduce memory usage at the cost of increased computation time during the backward pass. Another technique is to use mixed precision training, which can reduce the memory footprint of activations and gradients by using lower precision data types (like float16 or bfloat16) while still maintaining model performance.
+                    \begin{table}[h]
+                        \centering
+                        \resizebox{\linewidth}{!}{%
+                            \csvautobooktabular[respect underscore]{../benchmark_results/attention_scale_benchmark.csv}%
+                        }
+                    \end{table}
+            \end{enumerate}
+        \newpage
+        \item [1.2.1] \textbf{pytorch\_compile}
+            \begin{enumerate}[label=\alph*.]
+                \item The table for uncompiled vs compiled version of attention is given below
+                    \begin{table}[h]
+                        \centering
+                        \resizebox{\linewidth}{!}{%
+                            \csvautobooktabular[respect underscore]{../benchmark_results/attention_scale_compile_comparison.csv}%
+                        }
+                    \end{table}
+                \newpage
+                \item The table for uncompiled vs compiled version of the model is given below. The forward pass times for the compiled version are somewhat lower than the uncompiled version across all model sizes, which is expected since PyTorch's compilation can optimize the computation graph and fuse operations to improve performance. The forward+backward pass times for the compiled version are also somewhat lower than the uncompiled version across all model sizes, which is also expected since the optimizations from compilation can benefit both forward and backward computations. However, the performance improvement from compilation may not be very significant for smaller models, but it becomes more pronounced as the model size increases due to the larger computational load and greater opportunities for optimization.
+                    \begin{table}[h]
+                        \centering
+                            \begin{tabular}{|r|r|r|r|r|}
+                                \hline
+                                implementation & model\_size & pass & mean\_step\_ms & std\_step\_ms \\
+                                \hline
+                                uncompiled & small & forward & 34.7421 & 0.2440 \\
+                                \hline
+                                compiled & small & forward & 30.6835 & 0.3930 \\
+                                \hline
+                                uncompiled & small & forward+backward & 84.1578 & 0.4178 \\
+                                \hline
+                                compiled & small & forward+backward & 86.9557 & 0.3059 \\
+                                \hline
+                                uncompiled & medium & forward & 71.0755 & 3.2061  \\
+                                \hline
+                                compiled & medium & forward & 62.1534 & 2.7001  \\
+                                \hline
+                                uncompiled & medium & forward+backward & 215.5571 & 0.3645  \\
+                                \hline
+                                compiled & medium & forward+backward & 220.9293 & 1.1892  \\
+                                \hline
+                                uncompiled & large & forward & 141.2933 & 0.1184 \\
+                                \hline
+                                compiled & large & forward & 128.7720 & 0.0764 \\
+                                \hline
+                                uncompiled & large & forward+backward & 436.3411 & 0.3570  \\
+                                \hline
+                                compiled & large & forward+backward & 416.8952 & 0.9826  \\
+                                \hline
+                                uncompiled & xl & forward & 280.6156 & 0.0603 \\
+                                \hline
+                                compiled & xl & forward & 260.4873 & 0.3039 \\
+                                \hline
+                                uncompiled & xl & forward+backward & 888.9120 & 0.1919  \\
+                                \hline
+                                compiled & xl & forward+backward & 829.2161 & 0.1592  \\
+                                \hline
+                                uncompiled & 2.7B & forward & 417.7063 & 0.1057 \\
+                                \hline
+                                compiled & 2.7B & forward & 398.7467 & 0.0683 \\
+                                \hline
+                                uncompiled & 2.7B & forward+backward & 1320.3845 & 1.0714  \\
+                                \hline
+                                compiled & 2.7B & forward+backward & 1263.8836 & 0.3676  \\
+                                \hline
+                            \end{tabular}
+                    \end{table}
             \end{enumerate}
     \end{enumerate} 
 \end{enumerate}
