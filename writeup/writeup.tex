@@ -7,13 +7,15 @@
 \usepackage{mathtools}
 \usepackage{booktabs}
 \newif\iffastbuild
-\fastbuildtrue
+% \fastbuildtrue
 \iffastbuild
     \usepackage[draft]{graphicx}
 \else
     \usepackage{graphicx}
 \fi
 \usepackage{csvsimple}
+\usepackage{longtable}
+\setlongtables
 
 
 
@@ -44,7 +46,7 @@
     \begin{enumerate}
         \item[1.1.3] \textbf{\texttt{benchmarking\_script}}
             \begin{enumerate}[label=\alph*.]
-                \item The script is present at student/benchmark.py
+                \item The script is present at \texttt{student/benchmark.py}
                 \item The following table shows the timings for the forward and forward+backward passes for each of the model sizes (with context length as 256). The mean and standard deviation are computed across 10 runs for each model size and pass type.
                     \begin{table}[h]
                         \centering
@@ -75,15 +77,15 @@
                             \end{tabular}
                     \end{table}
                     Backward pass is taking significantly more time than the forward pass, which is expected since it involves computing gradients for all parameters. As the model size increases, both forward and backward pass times increase, with the backward pass showing a more significant increase due to the larger number of parameters and computations involved. Generally, variance in timings is low (medium forward pass has higher variance than others), which suggests that the measurements are consistent across runs.
-                \item When running the measurement steps without the warmup steps, the timings for the first couple of iterations are significantly higher than the subsequent iterations. This is obvious when running the measurement steps with 2 warmup steps, where the timings are almost same as runs with 5 warmup steps as in the previous experiment. This is because the first few iterations involve additional overhead from things like memory allocation, kernel compilation, and other setup tasks that are not representative of the steady-state performance of the model. By including warmup steps, we allow the system to reach a more stable state before we start measuring the performance, which results in more accurate and consistent timing measurements.
+                \item When running the measurement steps without the warmup steps, \textbf{the timings for the first couple of iterations are significantly higher than the subsequent iterations}. This is obvious when running the measurement steps with 2 warmup steps, where the timings are almost same as runs with 5 warmup steps as in the previous experiment. This is because the first few iterations involve additional overhead from things like memory allocation, kernel compilation, and other setup tasks that are not representative of the steady-state performance of the model. By including warmup steps, we allow the system to reach a more stable state before we start measuring the performance, which results in more accurate and consistent timing measurements.
             \end{enumerate}
         \item[1.1.4] \textbf{\texttt{nsys\_profile}}
             \begin{enumerate}[label=\alph*.]
-                \item The times for forward pass here are very similar to the times obtained in the previous section for the forward pass. This is expected since both measurements are for the same operation (forward pass) and should be consistent (The context length is the same in the comparision).
-                \item The CUDA kernel that takes the most time in the forward pass is the ampere\_sgemm\_128x64\_tn kernel, which is a matrix multiplication kernel used in the transformer block. This kernel is responsible for Q, K, V and output matrix multiplications in attention layer and feed forward layers weights computations. Per transformer block, there are 7 calls to this kernel and for one forward pass, it will be number of blocks * 7 calls to this kernel. In both forward and backward pass, there's another kuda kernel that takes almost similar time as the ampere\_sgemm\_128x64\_tn kernel, which is the ampere\_sgemm\_128x128\_nt kernel. This kernel is also a matrix multiplication kernel used in the transformer block, and it is responsible for the matrix multiplications in the feed forward layers and attention output computations. The presence of these two kernels as the most time-consuming ones in both forward and backward passes indicates that matrix multiplication operations are the primary bottleneck in the performance of the transformer model.
-                \item
-                \item
-                \item
+                \item Looking at medium model with 256 context length, the times for forward pass is around \textbf{90 ms which is a bit higher} than 71 ms found in the previous section. This is because the profiling overhead from nsys can add some additional time to the execution, especially if the profiler is collecting detailed information about GPU activity, memory usage, and other performance metrics. The profiling process can introduce latency due to the need to capture and record various events and data points during the execution of the model, which can lead to slightly higher timings compared to running the model without profiling.
+                \item Looking at medium model with 256 context length, the CUDA kernel that takes the most time in the forward pass is the \texttt{ampere\_sgemm\_128x64\_tn} kernel, which is a matrix multiplication kernel used in the transformer block. This kernel is responsible for Q, K, V and output matrix multiplications in attention layer and feed forward layers weights computations. Per transformer block, there are \textbf{7 calls} to this kernel and for one forward pass, it will be \textbf{number of transformer blocks * 7 calls} to this kernel. In both forward and backward pass, there're other kuda kernel that takes almost similar time as the \texttt{ampere\_sgemm\_128x64\_tn kernel} (25\%), which are the \texttt{ampere\_sgemm\_128x128\_nt} kernel (17.9\%) and \texttt{ampere\_sgemm\_64x32\_sliced1x4\_nt} (17.7\%). These kernel is also a matrix multiplication kernel used in the backward pass. The presence of these kernels as the most time-consuming ones in both forward and backward passes indicates that matrix multiplication operations are the primary bottleneck in the performance of the transformer model.
+                \item The kernels that take non trivial amount of time in the forward pass are the \texttt{elementwise\_kernel}, \texttt{vectorized\_elementwise\_kernel}, \texttt{reduce\_kernel} to name a few. Some of these are using in applying rope, computing softmax for example.
+                \item Looking at medium model with 256 context length, apart from the kernels and their fraction of time being similar to the ones in b part, I noticed a new kernel called \texttt{multi\_tensor\_apply\_kernel} in the optimizer step that takes up around 11\% of the time. This kernel is probably used in the AdamW optimizer for applying weight updates to the model parameters. The presence of this kernel as a significant contributor to the time taken in the optimizer step indicates that the weight update computations are a non-trivial part of the optimization process, and optimizing this kernel could potentially lead to performance improvements in the training loop.
+                \item Looking at the medium model with 256 context length, the runtime for softmax operation is around \textbf{121 microseconds} in the foward pass. And the matrix multiplications being done for \textbf{Q, K, V and output computations are around 148, 149, 150 and 159 microseconds respectively}. In the softmax calculation, there are around 3 kernels used - \texttt{elementwise\_kernel}, \texttt{vectorized\_elementwise\_kernel}, \texttt{reduce\_kernel} and all of them combined are used 5 times whereas each of the matmul operation uses one kernel. This indicates that the softmax operation is more complex and involves multiple steps (like computing the exponentials, summing them up, and normalizing) which require multiple kernel launches, while each matrix multiplication is a more straightforward operation that can be handled with a single kernel launch. The fact that the softmax operation launches multiple kernels and takes a significant amount of time compared to the matrix multiplications suggests that optimizing the softmax implementation could be a potential area for improving the overall performance of the attention mechanism in the transformer model.
             \end{enumerate}
         \item[1.1.5] \textbf{Mixed Precision}
             \begin{itemize}
@@ -100,7 +102,7 @@
                 \textbf{Case 2: Pure Float16 Accumulation}
                 Using 16-bit half precision significantly limits the available bits for the fraction, resulting in only about 3 decimal digits of precision. As the sum grows, the "gap" between representable numbers becomes larger than the 0.01 increment, causing the addition to lose precision or stall entirely, which leads to the inaccurate result of 9.9531.\\
                 \textbf{Case 3: In-place Mixed Precision Addition}
-                This case uses a Float32 sum but attempts to add a Float16 tensor directly to it, which triggers implicit type promotion. While the sum is more stable than Case 2, the increment itself was already "quantized" to a less accurate Float16 version of 0.01, resulting in a final sum (10.0021) that carries that initial approximation error through 1,000 steps.\\
+                This case uses a Float32 sum but attempts to add a Float16 tensor directly to it, which triggers implicit type promotion. While the sum is more stable than Case 2, the increment itself was already ``quantized'' to a less accurate Float16 version of 0.01, resulting in a final sum (10.0021) that carries that initial approximation error through 1,000 steps.\\
                 \textbf{Case 4: Explicit Float32 Casting}
                 This implementation explicitly casts the Float16 increment to Float32 before performing the addition to ensure the operation occurs in a high-precision space. The result is identical to Case 3 (10.0021) because the bottleneck is the original creation of the value in Float16; once the precision is lost during the initial tensor creation, casting it to Float32 cannot recover the original ``perfect'' decimal value.\\
                 \item \textbf{benchmarking\_mixed\_precision}
@@ -126,7 +128,7 @@
             \end{itemize}
         \item [1.1.6] \textbf{memory\_profiling}
             \begin{enumerate}[label=\alph*.]
-                \item The following two images are the memory profiles for the forward pass and the full training step (forward+backward+optimizer) for the large model at context length 512. The memory usage is significantly higher for the full training step compared to the forward pass alone, which is expected since the backward pass and optimizer steps require additional memory for storing gradients and optimizer states. The peaks in memory usage correspond to the points in the computation where large intermediate tensors are created, such as during matrix multiplications in the transformer blocks. The memory profile also shows that the memory usage is relatively stable during the forward pass, while it fluctuates more during the full training step due to the additional computations and memory allocations involved in the backward pass and optimization steps.
+                \item The following two images are the memory profiles for the forward pass and the full training step (forward+backward+optimizer) for the \textbf{large model at context length 512}. \textbf{The memory usage is significantly higher for the full training step compared to the forward pass alone}, which is expected since the backward pass and optimizer steps require additional memory for storing gradients and optimizer states. The peaks in memory usage correspond to the points in the computation where large intermediate tensors are created, such as during matrix multiplications in the transformer blocks. The memory profile also shows that the memory usage is relatively stable during the forward pass, while it fluctuates more during the full training step due to the additional computations and memory allocations involved in the backward pass and optimization steps.
                     \begin{center}
                         \includegraphics[width=0.8\textwidth]{../charts/large_forward_pass_memory_profile.png}
                     \end{center}
@@ -164,8 +166,8 @@
                             \end{tabular}
                     \end{table}
                     \newline
-                    The peak memory usage for the forward pass is higher in mixed precision compared to pure float32 precision. This is because in mixed precision, some tensors are stored in lower precision (like float16 or bfloat16) which can lead to increased memory fragmentation and overhead from storing additional metadata for managing different data types. However, the peak memory usage for the full training step is lower in mixed precision compared to pure float32 precision. This is because mixed precision allows for reduced memory bandwidth and faster computation, which can lead to more efficient use of memory during the backward pass and optimization steps, ultimately resulting in lower overall memory usage compared to pure float32 precision.
-                \item The size of a tensor of activations in the Transformer residual stream, in single precision, for large model with context length 512 is around 80 MiB. This is calculated based on the dimensions of the tensor (batch size, sequence length, hidden size) and the data type (float32) used for storing the activations. The memory usage can be computed as: 
+                    \textbf{The peak memory usage for the forward pass is higher in mixed precision compared to pure float32 precision}. This might be because in mixed precision, some tensors are stored in lower precision (like float16 or bfloat16) which can lead to increased memory fragmentation and overhead from storing additional metadata for managing different data types. However, \textbf{the peak memory usage for the full training step is lower in mixed precision compared to pure float32 precision}. This might be because mixed precision allows for reduced memory bandwidth and faster computation, which can lead to more efficient use of memory during the backward pass and optimization steps, ultimately resulting in lower overall memory usage compared to pure float32 precision.
+                \item The size of a tensor of activations in the Transformer residual stream, in single precision, for \textbf{large model with context length 512 is around 10 MB}. This is calculated based on the dimensions of the tensor (batch size, sequence length, hidden size) and the data type (float32) used for storing the activations. The memory usage can be computed as: 
                     \begin{align*}
                         \text{Memory Usage} = \text{Batch Size} \times \text{Sequence Length} \times \text{Hidden Size} \times \text{Bytes per Element}
                     \end{align*}
@@ -177,7 +179,7 @@
             \end{enumerate}
         \item [1.2.1] \textbf{pytorch\_attention}
             \begin{enumerate}[label=\alph*.]
-                \item Attention scaling benchmark results are given below. The out of memory errors are seen for context length of 16384 across d\_model sizes. For d\_model size of 16 and context length of 16384, the memory for attention is around 16 GiB. This comes from the calculation of qkv, output and probability tensors. As the context length increases, the memory saved for backward pass increases significantly as seen in the table. To eliminate this memory cost, we can use techniques like gradient checkpointing, which allows us to recompute intermediate activations during the backward pass instead of storing them all in memory. This can significantly reduce memory usage at the cost of increased computation time during the backward pass. Another technique is to use mixed precision training, which can reduce the memory footprint of activations and gradients by using lower precision data types (like float16 or bfloat16) while still maintaining model performance.
+                \item Using the script in \texttt{student/attention\_scale\_benchmark.py}, the attention scaling benchmark results are given below. \textbf{The out of memory errors are seen for context length of 16384 across d\_model sizes}. For d\_model size of 16 and context length of 16384, the \textbf{memory for attention is around 16 GiB}. This comes from the calculation of qkv, output and probability tensors. There seems to be other unoptimized memory allocations as well which contribute to the overall memory usage and lead to out of memory errors. As the context length increases, the memory saved for backward pass increases significantly as seen in the table. To eliminate this memory cost, we can use techniques like gradient checkpointing, which allows us to recompute intermediate activations during the backward pass instead of storing them all in memory. This can significantly reduce memory usage at the cost of increased computation time during the backward pass. Another technique is to use mixed precision training, which can reduce the memory footprint of activations and gradients by using lower precision data types (like float16 or bfloat16) while still maintaining model performance.
                     \begin{table}[h]
                         \centering
                         \resizebox{\linewidth}{!}{%
@@ -188,7 +190,7 @@
         \newpage
         \item [1.2.1] \textbf{pytorch\_compile}
             \begin{enumerate}[label=\alph*.]
-                \item The table for uncompiled vs compiled version of attention is given below
+                \item The table for uncompiled vs compiled version of attention is given below. We can see that there is a bit of improvement for higher context length runs and there's no out of memory error for compiled version. This is because PyTorch's compilation can optimize the computation graph and memory usage, which can lead to more efficient execution and reduced memory overhead. The optimizations performed by the compiler can help to better manage memory and reduce the likelihood of out of memory errors, especially for larger context lengths where memory usage is more significant.
                     \begin{table}[h]
                         \centering
                         \resizebox{\linewidth}{!}{%
@@ -257,6 +259,17 @@
                                 \hline
                             \end{tabular}
                     \end{table}
+            \end{enumerate}
+        \item [1.3.2] \textbf{flash\_benchmarking}
+            \begin{enumerate}[label=\alph*.]
+                \item The table for flash attention vs pytorch attention is given below. Majorly, there's decrease in time using triton flash attention compared to pytorch attention across all model sizes and pass types. There are few cases where the times for triton flash attention are somewhat higher than pytorch attention (mainly when seq\_len is high, dtype is bfloat16 and d is 64 or 128), but overall the trend is that flash attention is faster. The performance improvement from flash attention can be attributed to its optimized implementation for GPU architectures, which can significantly reduce the time taken for attention computations, especially as the model size increases.
+                    \begingroup
+                    \tiny
+                    \setlength\tabcolsep{2pt}
+                    \setlength\LTleft{50pt}
+                    \setlength\LTright{0pt}
+                    \csvautolongtable[respect underscore]{../benchmark_results/flash_benchmark_results.csv}
+                    \endgroup
             \end{enumerate}
     \end{enumerate} 
 \end{enumerate}

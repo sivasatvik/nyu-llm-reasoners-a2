@@ -2,17 +2,15 @@ from __future__ import annotations
 
 import torch
 import math
-from einops import rearrange, einsum
+from einops import einsum
 
 
 class FlashAttentionPytorch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q : torch.Tensor, K : torch.Tensor, V : torch.Tensor, is_causal=False):
         B_q = B_k = 16
-        # B_k = 1
         T_q = math.ceil(Q.shape[-2] // B_q)
         T_k = math.ceil(K.shape[-2] // B_k)
-        print(K.shape)
         d = Q.shape[-1]
         device = "cpu"
         O_i = torch.empty(*Q.shape[:-2],B_q, d, device= device)
